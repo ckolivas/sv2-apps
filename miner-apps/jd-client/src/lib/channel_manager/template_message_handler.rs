@@ -37,7 +37,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
-        self.maybe_expire_bridge();
+        self.maybe_expire_bridge().await;
 
         // While bridging a pool tip that is ahead of local bitcoind, fee-bump
         // NewTemplates still describe the *old* local tip. Do not exit the bridge
@@ -455,7 +455,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
-        self.maybe_expire_bridge();
+        self.maybe_expire_bridge().await;
 
         // Local tip catch-up ends bridge mode (soft cutover to local JD work).
         // Prefer this over fee-bump NewTemplates, which may still be on the old tip.

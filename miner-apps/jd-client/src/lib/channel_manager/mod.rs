@@ -628,7 +628,10 @@ impl ChannelManager {
     }
 
     /// Expire an active bridge session if its deadline has passed.
-    pub(crate) fn maybe_expire_bridge(&self) {
+    ///
+    /// On timeout, leave bridge mode and re-announce the last known local tip work so
+    /// miners soft-cutover off unaccepted pool bridge jobs (clean=false semantics).
+    pub(crate) async fn maybe_expire_bridge(&self) {
         let expired = self
             .work_source
             .with(|ws| match ws {
@@ -642,7 +645,168 @@ impl ChannelManager {
         if let Some(epoch) = expired {
             self.exit_bridge(
                 epoch,
-                "upstream tip bridge timed out; waiting for local templates",
+                "upstream tip bridge timed out; re-announcing local tip work (clean=false cutover)",
+            );
+            self.reannounce_local_tip_work().await;
+        }
+    }
+
+    /// Re-fan the last known local tip job + prevhash to all downstreams.
+    ///
+    /// Used after a bridge timeout so miners do not keep hashing pool tip work that
+    /// will no longer be accepted via [`Self::bridge_job_map`]. Local tip catch-up
+    /// (new `SetNewPrevHash` from TP) already re-announces via the normal TDP path.
+    pub(crate) async fn reannounce_local_tip_work(&self) {
+        let prevhash = match self.last_new_prev_hash.get() {
+            Ok(Some(p)) => p,
+            _ => {
+                info!(
+                    "Bridge timed out with no local prevhash yet — miners wait for local TP"
+                );
+                return;
+            }
+        };
+
+        let mut messages: Vec<RouteMessageTo> = Vec::new();
+        let build = self.downstream.try_for_each(|downstream_id, downstream| {
+            let requires_standard_jobs = downstream.require_std_job.load(Ordering::Relaxed);
+
+            let (group_channel_id, empty_group, active_group_job) = downstream
+                .group_channel
+                .with(|gc| {
+                    (
+                        gc.get_group_channel_id(),
+                        gc.is_empty(),
+                        gc.get_active_job().cloned(),
+                    )
+                })
+                .map_err(JDCError::shutdown)?;
+
+            if !requires_standard_jobs && !empty_group {
+                let Some(active_job) = active_group_job else {
+                    warn!(
+                        downstream_id,
+                        "No active local group job to re-announce after bridge timeout"
+                    );
+                    return Ok(());
+                };
+
+                let job_id = active_job.get_job_id();
+                let job_msg = active_job.get_job_message().clone();
+
+                messages.push(
+                    (downstream_id, Mining::NewExtendedMiningJob(job_msg)).into(),
+                );
+                messages.push(
+                    (
+                        downstream_id,
+                        Mining::SetNewPrevHash(SetNewPrevHash {
+                            channel_id: group_channel_id,
+                            job_id,
+                            prev_hash: prevhash.prev_hash.clone(),
+                            min_ntime: prevhash.header_timestamp,
+                            nbits: prevhash.n_bits,
+                        }),
+                    )
+                        .into(),
+                );
+
+                downstream
+                    .extended_channels
+                    .try_for_each_mut(|channel_id, extended_channel| {
+                        self.downstream_channel_id_and_job_id_to_template_id.insert(
+                            (downstream_id, channel_id, job_id).into(),
+                            prevhash.template_id,
+                        );
+                        extended_channel
+                            .on_group_channel_job(active_job.clone())
+                            .map_err(|e| {
+                                error!(
+                                    ?e,
+                                    channel_id,
+                                    "Failed to re-apply local group job on extended channel"
+                                );
+                                JDCError::shutdown(e)
+                            })?;
+                        Ok::<(), JDCError<error::ChannelManager>>(())
+                    })?;
+
+                downstream
+                    .standard_channels
+                    .try_for_each_mut(|channel_id, standard_channel| {
+                        self.downstream_channel_id_and_job_id_to_template_id.insert(
+                            (downstream_id, channel_id, job_id).into(),
+                            prevhash.template_id,
+                        );
+                        standard_channel
+                            .on_group_channel_job(active_job.clone())
+                            .map_err(|e| {
+                                error!(
+                                    ?e,
+                                    channel_id,
+                                    "Failed to re-apply local group job on standard channel"
+                                );
+                                JDCError::shutdown(e)
+                            })?;
+                        Ok::<(), JDCError<error::ChannelManager>>(())
+                    })?;
+            } else if requires_standard_jobs {
+                downstream
+                    .standard_channels
+                    .try_for_each_mut(|channel_id, standard_channel| {
+                        let Some(active) = standard_channel.get_active_job().cloned() else {
+                            warn!(
+                                downstream_id,
+                                channel_id,
+                                "No active standard job to re-announce after bridge timeout"
+                            );
+                            return Ok(());
+                        };
+                        let job_id = active.get_job_id();
+                        let job_msg = active.get_job_message().clone();
+                        self.downstream_channel_id_and_job_id_to_template_id.insert(
+                            (downstream_id, channel_id, job_id).into(),
+                            prevhash.template_id,
+                        );
+                        messages.push((downstream_id, Mining::NewMiningJob(job_msg)).into());
+                        messages.push(
+                            (
+                                downstream_id,
+                                Mining::SetNewPrevHash(SetNewPrevHash {
+                                    channel_id,
+                                    job_id,
+                                    prev_hash: prevhash.prev_hash.clone(),
+                                    min_ntime: prevhash.header_timestamp,
+                                    nbits: prevhash.n_bits,
+                                }),
+                            )
+                                .into(),
+                        );
+                        Ok::<(), JDCError<error::ChannelManager>>(())
+                    })?;
+            }
+
+            Ok::<(), JDCError<error::ChannelManager>>(())
+        });
+
+        if let Err(e) = build {
+            error!(
+                error = ?e,
+                "Error building local tip re-announce after bridge timeout"
+            );
+            return;
+        }
+
+        let count = messages.len();
+        for message in messages {
+            if let Err(e) = message.forward(&self.channel_manager_io).await {
+                error!("Failed to forward local tip re-announce: {e:?}");
+            }
+        }
+        if count > 0 {
+            info!(
+                messages = count,
+                "Re-announced local tip work after upstream tip bridge timeout (soft cutover)"
             );
         }
     }
@@ -1088,7 +1252,7 @@ impl ChannelManager {
                         break;
                     }
                     _ = bridge_tick.tick() => {
-                        cm.maybe_expire_bridge();
+                        cm.maybe_expire_bridge().await;
                     }
                     res = &mut vardiff_future => {
                         info!("Vardiff loop completed with: {res:?}");

@@ -840,7 +840,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         }
 
         info!("Received (tip bridge candidate): {}", msg);
-        self.maybe_expire_bridge();
+        self.maybe_expire_bridge().await;
         self.try_activate_upstream_tip_bridge(msg.into_static())
             .await
     }

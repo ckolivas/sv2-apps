@@ -1531,7 +1531,7 @@ impl ChannelManager {
         msg: SubmitSharesExtended<'_>,
         bridge_ref: BridgeJobRef,
     ) -> Result<(), JDCError<error::ChannelManager>> {
-        self.maybe_expire_bridge();
+        self.maybe_expire_bridge().await;
 
         let channel_id = msg.channel_id;
         let mut messages: Vec<RouteMessageTo> = Vec::new();
