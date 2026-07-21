@@ -140,7 +140,8 @@ upstream_tip_work_timeout_secs = 30
 | Pool tip **≠** local tip (or no local tip yet) | Enter bridge: rewrite and fan out pool work to downstreams |
 | Pool tip **==** local tip | Ignore pool work; local JD path owns the tip |
 | New downstream channel while bridging | Late joiners receive the active bridge job (not stale local tip) |
-| Local `NewTemplate` / `SetNewPrevHash` | Exit bridge and switch to local work (soft cutover) |
+| Local fee-bump `NewTemplate` (same old tip) | Stay on bridge (do not return miners to a stale tip) |
+| Local `SetNewPrevHash` (tip catch-up) | Exit bridge and switch to local work (soft cutover) |
 | Timeout | Exit bridge and wait for the next local (or pool) tip update |
 
 Shares found on bridged work are validated against the upstream pool job and submitted to the pool

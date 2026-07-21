@@ -39,12 +39,10 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         info!("Received: {}", msg);
         self.maybe_expire_bridge();
 
-        // Local work takes priority over a temporary pool tip bridge (soft cutover).
-        if self.is_bridging() {
-            self.exit_bridge_any(
-                "local NewTemplate received — exiting upstream tip bridge (clean=false cutover)",
-            );
-        }
+        // While bridging a pool tip that is ahead of local bitcoind, fee-bump
+        // NewTemplates still describe the *old* local tip. Do not exit the bridge
+        // here — that would put miners back on stale work. Exit only on local
+        // SetNewPrevHash (tip catch-up) or bridge timeout.
 
         self.template_store
             .insert(msg.template_id, msg.clone().into_static());
@@ -459,15 +457,31 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         info!("Received: {}", msg);
         self.maybe_expire_bridge();
 
-        // Local tip update ends bridge mode; remaining path builds local jobs for downstreams.
+        // Local tip catch-up ends bridge mode (soft cutover to local JD work).
+        // Prefer this over fee-bump NewTemplates, which may still be on the old tip.
+        let new_local_tip = msg.prev_hash.to_array();
         if self.is_bridging() {
-            self.exit_bridge_any(
-                "local SetNewPrevHash received — exiting upstream tip bridge (clean=false cutover)",
-            );
+            let bridge_prev = self
+                .work_source
+                .with(|ws| match ws {
+                    crate::channel_manager::WorkSource::UpstreamBridge {
+                        pool_prev_hash, ..
+                    } => Some(*pool_prev_hash),
+                    _ => None,
+                })
+                .ok()
+                .flatten();
+
+            let reason = if bridge_prev == Some(new_local_tip) {
+                "local tip caught up to pool tip — exiting upstream tip bridge (clean=false cutover)"
+            } else {
+                "local tip advanced — exiting upstream tip bridge (clean=false cutover)"
+            };
+            self.exit_bridge_any(reason);
         }
 
         // Track tip history so a lagging pool tip is not mistaken for "pool ahead".
-        self.record_local_tip(msg.prev_hash.to_array());
+        self.record_local_tip(new_local_tip);
 
         let outputs = deserialize_outputs(self.coinbase_outputs.get().map_err(JDCError::shutdown)?)
             .map_err(|_| JDCError::shutdown(JDCErrorKind::ChannelManagerHasBadCoinbaseOutputs))?;
