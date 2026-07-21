@@ -66,7 +66,7 @@ pub struct JobDeclaratorClientConfig {
     #[serde(default = "default_reserved_downstream_rollable_extranonce_size")]
     reserved_downstream_rollable_extranonce_size: u8,
     /// When true, briefly mine pool-provided tip work if the pool tip appears ahead of the local
-    /// template provider (e.g. bitcoind lagging a pool tip push). Defaults to enabled.
+    /// template provider (e.g. bitcoind lagging a pool tip push). Defaults to **disabled** (opt-in).
     #[serde(default = "default_accept_upstream_tip_work")]
     accept_upstream_tip_work: bool,
     /// Max seconds to stay on pool tip work before reverting to waiting for local templates.
@@ -99,7 +99,9 @@ fn default_upstream_tip_work_timeout_secs() -> u64 {
 }
 
 fn default_accept_upstream_tip_work() -> bool {
-    true
+    // Opt-in: bridging suspends JDC's own block construction for a timeout window
+    // and trusts pool tip work. Operators must explicitly enable it.
+    false
 }
 
 impl JobDeclaratorClientConfig {
@@ -144,7 +146,7 @@ impl JobDeclaratorClientConfig {
             reserved_downstream_rollable_extranonce_size:
                 reserved_downstream_rollable_extranonce_size
                     .unwrap_or(DEFAULT_RESERVED_DOWNSTREAM_ROLLABLE_EXTRANONCE_SIZE),
-            accept_upstream_tip_work: true,
+            accept_upstream_tip_work: false,
             upstream_tip_work_timeout_secs: DEFAULT_UPSTREAM_TIP_WORK_TIMEOUT_SECS,
         }
     }

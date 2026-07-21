@@ -131,14 +131,18 @@ pub enum WorkSource {
     UpstreamBridge {
         /// Monotonic epoch so timeout tasks can ignore stale deadlines.
         epoch: u64,
+        /// When this bridge session started (timeout diagnostics / future policy).
         #[allow(dead_code)]
         accepted_at: Instant,
         deadline: Instant,
         pool_prev_hash: [u8; 32],
+        /// Pool job id accepted for this session (diagnostics / future policy).
         #[allow(dead_code)]
         pool_job_id: UpstreamJobId,
+        /// Pool nbits accepted after plausibility checks.
         #[allow(dead_code)]
         pool_nbits: u32,
+        /// Pool min_ntime accepted after plausibility checks.
         #[allow(dead_code)]
         pool_min_ntime: u32,
     },
@@ -148,10 +152,11 @@ pub enum WorkSource {
 #[derive(Debug, Clone)]
 pub struct BridgeJobRef {
     pub pool_job_id: UpstreamJobId,
-    #[allow(dead_code)]
+    /// Pool tip prev_hash (for share header reconstruction / downstream target checks).
     pub pool_prev_hash: [u8; 32],
-    #[allow(dead_code)]
+    /// Pool nbits used when the bridge job was minted (share header reconstruction).
     pub pool_nbits: u32,
+    /// Pool min_ntime used when the bridge job was minted (header reconstruction / diagnostics).
     #[allow(dead_code)]
     pub pool_min_ntime: u32,
     /// Epoch of the bridge session that minted this job.

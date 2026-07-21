@@ -15,14 +15,68 @@ pub enum TipBridgeDecision {
     PoolBehindIgnore,
     /// Already bridging this exact pool tip — ignore duplicate push.
     AlreadyBridgingIgnore,
+    /// No local tip history yet — refuse to bridge until local TP has spoken.
+    WaitForLocalTip,
+}
+
+/// How far pool `min_ntime` may lead local header timestamp (seconds).
+pub const MAX_POOL_NTIME_AHEAD_SECS: u32 = 7_200;
+/// How far pool `min_ntime` may lag local header timestamp (seconds).
+pub const MAX_POOL_NTIME_BEHIND_SECS: u32 = 7_200;
+
+/// Why a pool tip failed [`check_pool_tip_plausibility`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TipPlausibilityReject {
+    /// Pool nbits differ from the current local tip's nbits.
+    NbitsMismatch { pool: u32, local: u32 },
+    /// Pool min_ntime is too far ahead of the local header timestamp.
+    MinNtimeTooFarAhead { pool: u32, local: u32 },
+    /// Pool min_ntime is too far behind the local header timestamp.
+    MinNtimeTooFarBehind { pool: u32, local: u32 },
+}
+
+/// Lightweight checks before entering bridge mode.
+///
+/// This is not a full header proof — it only rejects obviously wrong tips when a local
+/// tip is already known (mismatched difficulty bits, absurd timestamps).
+pub fn check_pool_tip_plausibility(
+    pool_nbits: u32,
+    pool_min_ntime: u32,
+    local_nbits: Option<u32>,
+    local_header_timestamp: Option<u32>,
+) -> Result<(), TipPlausibilityReject> {
+    if let Some(local_nbits) = local_nbits {
+        if pool_nbits != local_nbits {
+            return Err(TipPlausibilityReject::NbitsMismatch {
+                pool: pool_nbits,
+                local: local_nbits,
+            });
+        }
+    }
+    if let Some(local_ts) = local_header_timestamp {
+        if pool_min_ntime > local_ts.saturating_add(MAX_POOL_NTIME_AHEAD_SECS) {
+            return Err(TipPlausibilityReject::MinNtimeTooFarAhead {
+                pool: pool_min_ntime,
+                local: local_ts,
+            });
+        }
+        if local_ts > pool_min_ntime.saturating_add(MAX_POOL_NTIME_BEHIND_SECS) {
+            return Err(TipPlausibilityReject::MinNtimeTooFarBehind {
+                pool: pool_min_ntime,
+                local: local_ts,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Decide whether to activate the tip bridge for a pool `SetNewPrevHash`.
 ///
 /// Without full header parent checks, we use local tip history:
+/// - empty history → wait for local tip first (do not bridge blindly on startup)
 /// - equal to current local tip → same tip
 /// - present in recent *prior* local tips → pool behind (stale)
-/// - otherwise → assume pool ahead (enter bridge)
+/// - otherwise → assume pool ahead (enter bridge), subject to plausibility checks
 ///
 /// `recent_local_tips` is ordered oldest → newest and should include the current tip
 /// as the last element when known.
@@ -38,6 +92,12 @@ pub fn decide_tip_bridge(
 
     if currently_bridging_prev == Some(pool_prev) {
         return TipBridgeDecision::AlreadyBridgingIgnore;
+    }
+
+    // Refuse to enter bridge until we have at least one local tip; otherwise the first
+    // pool push always looks "ahead" even when it is the same tip as bitcoind.
+    if recent_local_tips.is_empty() {
+        return TipBridgeDecision::WaitForLocalTip;
     }
 
     let current_local = recent_local_tips.last().copied();
@@ -56,6 +116,20 @@ pub fn decide_tip_bridge(
     }
 
     TipBridgeDecision::EnterBridge
+}
+
+/// Whether a computed share hash meets a target (both little-endian 32-byte targets).
+#[inline]
+pub fn share_meets_target(share_hash_le: &[u8; 32], target_le: &[u8; 32]) -> bool {
+    // Compare as 256-bit little-endian integers: share <= target.
+    for i in (0..32).rev() {
+        match share_hash_le[i].cmp(&target_le[i]) {
+            std::cmp::Ordering::Less => return true,
+            std::cmp::Ordering::Greater => return false,
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+    true
 }
 
 /// Push `tip` onto a bounded history ring (oldest dropped when full).
@@ -165,12 +239,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tip_bridge_enters_when_no_local_tip() {
+    fn tip_bridge_waits_when_no_local_tip_history() {
         let pool = [1u8; 32];
         assert_eq!(
             decide_tip_bridge(true, &[], pool, None),
-            TipBridgeDecision::EnterBridge
+            TipBridgeDecision::WaitForLocalTip
         );
+    }
+
+    #[test]
+    fn tip_plausibility_rejects_nbits_mismatch() {
+        assert_eq!(
+            check_pool_tip_plausibility(0x1d00ffff, 100, Some(0x17033ec5), Some(100)),
+            Err(TipPlausibilityReject::NbitsMismatch {
+                pool: 0x1d00ffff,
+                local: 0x17033ec5,
+            })
+        );
+    }
+
+    #[test]
+    fn tip_plausibility_rejects_ntime_skew() {
+        let local = 1_700_000_000u32;
+        assert!(matches!(
+            check_pool_tip_plausibility(1, local + MAX_POOL_NTIME_AHEAD_SECS + 1, Some(1), Some(local)),
+            Err(TipPlausibilityReject::MinNtimeTooFarAhead { .. })
+        ));
+        assert!(matches!(
+            check_pool_tip_plausibility(1, local - MAX_POOL_NTIME_BEHIND_SECS - 1, Some(1), Some(local)),
+            Err(TipPlausibilityReject::MinNtimeTooFarBehind { .. })
+        ));
+    }
+
+    #[test]
+    fn tip_plausibility_ok_when_aligned() {
+        assert_eq!(
+            check_pool_tip_plausibility(0x17033ec5, 100, Some(0x17033ec5), Some(90)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn share_meets_target_ordering() {
+        let easy = [0xff; 32];
+        let hard = [0x00; 32];
+        let mid = {
+            let mut m = [0x00; 32];
+            m[0] = 0x80;
+            m
+        };
+        assert!(share_meets_target(&hard, &easy));
+        assert!(!share_meets_target(&easy, &hard));
+        assert!(share_meets_target(&mid, &mid));
     }
 
     #[test]

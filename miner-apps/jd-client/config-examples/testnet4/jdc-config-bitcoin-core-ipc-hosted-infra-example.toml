@@ -24,7 +24,7 @@ share_batch_size = 10
 # "COINBASEONLY" - coinbase-only mining
 mode = "FULLTEMPLATE"
 
-# Upstream tip lag bridge (defaults: enabled / 30s). When the pool tip is ahead of
+# Upstream tip lag bridge (defaults: disabled (opt-in) / 30s). When the pool tip is ahead of
 # the local template provider, briefly mine pool tip work, then soft-cutover back.
 # accept_upstream_tip_work = true
 # upstream_tip_work_timeout_secs = 30

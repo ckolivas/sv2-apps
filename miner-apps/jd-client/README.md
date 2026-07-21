@@ -125,34 +125,39 @@ and declares custom jobs to the pool. Some pool implementations (for example ckp
 push a short tip update on the **mining** channel (`NewExtendedMiningJob` + `SetNewPrevHash`) when
 the pool tip is ahead of a lagging local node.
 
-JDC can **temporarily** accept that pool tip work so miners do not stay on a stale tip:
+JDC can **temporarily** accept that pool tip work so miners do not stay on a stale tip.
+This is **opt-in** (default `false`): while bridging, miners hash pool-asserted work rather than
+JDC-declared templates.
 
 ```toml
-# Default: true (enabled). Set false to ignore pool tip pushes (legacy behaviour).
-accept_upstream_tip_work = true
+# Default: false (disabled). Set true only if you accept mining pool tip work while local TP lags.
+accept_upstream_tip_work = false
 
-# Max seconds to stay on pool tip work before waiting again for local templates.
+# Max seconds to stay on pool tip work before soft-cutover back to local templates.
 upstream_tip_work_timeout_secs = 30
 ```
 
 | When | Behaviour |
 |---|---|
-| Pool tip **≠** local tip (or no local tip yet) | Enter bridge: rewrite and fan out pool work to downstreams |
+| No local tip history yet | Do **not** bridge (wait for local TP) |
+| Pool tip **≠** local tip (and unknown in history) | Enter bridge after nbits/ntime plausibility checks |
 | Pool tip **==** local tip | Ignore pool work; local JD path owns the tip |
-| New downstream channel while bridging | Late joiners (extended **and** standard) receive the active bridge job (not stale local tip) |
+| Pool nbits ≠ local nbits, or min_ntime implausible | Reject pool tip (do not bridge) |
+| New downstream channel while bridging | Late joiners (extended **and** standard) receive the active bridge job |
 | Local fee-bump `NewTemplate` (same old tip) | Stay on bridge: refresh internal channel state only — **no** mining fan-out / custom-job push |
 | Local `SetNewPrevHash` (tip catch-up) | Exit bridge and switch to local work (soft cutover) |
-| Timeout | Exit bridge, **re-announce last local tip** to miners, and **re-sync JD** (`SetCustomMiningJob` / re-declare) so the pool accepts local-tip shares again |
+| Timeout | Exit bridge, **re-announce last local tip** to miners, and **re-sync JD** |
 
-Shares found on bridged work (extended or standard channels) are validated against the upstream
-pool job and submitted to the pool only (they are not declared via JDS / submitted to the local TP
-as JDC custom jobs).
+Bridge shares: validated against the **downstream (vardiff) target** for miner ack/vardiff, and
+**independently** against the upstream pool target for forwarding. Pool-only rejects no longer
+produce spurious `invalid-share` to the miner. Bridged solutions go to the pool only (not JDS/TP).
 
 **Note:** Tip comparison uses local tip history (not full `getblockheader` parent proofs):
 
+- empty local history → wait  
 - pool tip == current local tip → ignore  
 - pool tip matches an *older* local tip → treat as pool-behind, ignore  
-- otherwise → enter bridge (likely pool-ahead)
+- otherwise → enter bridge (likely pool-ahead), subject to nbits/ntime checks
 
 Keep pool usernames/worker names unique for connected miners. If two connected miners use the same
 name, telemetry is not assigned to either of them and the monitoring API reports

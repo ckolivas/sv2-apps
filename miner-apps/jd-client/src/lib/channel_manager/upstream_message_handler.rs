@@ -41,9 +41,10 @@ impl ChannelManager {
         &mut self,
         snph: SetNewPrevHash<'static>,
     ) -> Result<(), JDCError<error::ChannelManager>> {
+        // Peek without consuming so a failed activation leaves the buffer intact.
         let pool_job = self
             .pending_upstream_job
-            .with(|pending| pending.take())
+            .with(|pending| pending.clone())
             .map_err(JDCError::shutdown)?;
 
         let Some(pool_job) = pool_job else {
@@ -55,8 +56,9 @@ impl ChannelManager {
             warn!(
                 buffered_job_id = pool_job.job_id,
                 snph_job_id = snph.job_id,
-                "Buffered upstream job id does not match SetNewPrevHash — ignoring tip bridge"
+                "Buffered upstream job id does not match SetNewPrevHash — dropping buffered job"
             );
+            let _ = self.pending_upstream_job.with(|pending| *pending = None);
             return Ok(());
         }
 
@@ -83,23 +85,60 @@ impl ChannelManager {
         ) {
             TipBridgeDecision::SameTipIgnore => {
                 info!("Pool tip matches local tip — not entering upstream tip bridge");
+                let _ = self.pending_upstream_job.with(|pending| *pending = None);
                 return Ok(());
             }
             TipBridgeDecision::PoolBehindIgnore => {
                 info!(
                     "Pool tip matches an older local tip — pool is behind; ignoring tip bridge"
                 );
+                let _ = self.pending_upstream_job.with(|pending| *pending = None);
                 return Ok(());
             }
             TipBridgeDecision::AlreadyBridgingIgnore => {
                 debug!("Already bridging this pool tip — ignoring duplicate push");
+                let _ = self.pending_upstream_job.with(|pending| *pending = None);
+                return Ok(());
+            }
+            TipBridgeDecision::WaitForLocalTip => {
+                info!(
+                    "No local tip history yet — not entering upstream tip bridge until local TP speaks"
+                );
+                // Drop buffer; pool must re-push after local tip is known.
+                let _ = self.pending_upstream_job.with(|pending| *pending = None);
                 return Ok(());
             }
             TipBridgeDecision::EnterBridge => {}
         }
 
+        let local_tip_meta = self
+            .last_new_prev_hash
+            .with(|ph| ph.as_ref().map(|p| (p.n_bits, p.header_timestamp)))
+            .map_err(JDCError::shutdown)?;
+        let (local_nbits, local_ts) = match local_tip_meta {
+            Some((n, t)) => (Some(n), Some(t)),
+            None => (None, None),
+        };
+        if let Err(reason) = crate::channel_manager::tip_bridge::check_pool_tip_plausibility(
+            snph.nbits,
+            snph.min_ntime,
+            local_nbits,
+            local_ts,
+        ) {
+            warn!(
+                ?reason,
+                pool_nbits = snph.nbits,
+                pool_min_ntime = snph.min_ntime,
+                "Pool tip failed plausibility checks — not entering upstream tip bridge"
+            );
+            let _ = self.pending_upstream_job.with(|pending| *pending = None);
+            return Ok(());
+        }
+
         // Store job on the client-side upstream channel for share validation / forward.
-        self.upstream_channel
+        // Only consume the buffer after this succeeds.
+        let store_ok = self
+            .upstream_channel
             .with(|maybe_upstream| {
                 let Some(upstream) = maybe_upstream.as_mut() else {
                     return Err(JDCError::log(JDCErrorKind::UpstreamNotFound));
@@ -127,7 +166,14 @@ impl ChannelManager {
                     })?;
                 Ok(())
             })
-            .map_err(JDCError::shutdown)??;
+            .map_err(JDCError::shutdown)?;
+
+        if let Err(e) = store_ok {
+            // Leave pending_upstream_job so a later SNPH can retry if the race clears.
+            return Err(e);
+        }
+
+        let _ = self.pending_upstream_job.with(|pending| *pending = None);
 
         let epoch = self.bridge_epoch_factory.fetch_add(1, Ordering::Relaxed) as u64;
         let now = Instant::now();
@@ -167,6 +213,8 @@ impl ChannelManager {
         info!(
             epoch,
             pool_job_id,
+            pool_nbits,
+            pool_min_ntime,
             timeout_secs = self.upstream_tip_work_timeout.as_secs(),
             "Entering upstream tip bridge — pool tip appears ahead of local TP"
         );
@@ -850,7 +898,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
             return Ok(());
         }
 
-        info!("Received (buffering for tip bridge): {}", msg);
+        debug!("Received (buffering for tip bridge): {}", msg);
         self.pending_upstream_job
             .with(|pending| *pending = Some(msg.into_static()))
             .map_err(JDCError::shutdown)?;
