@@ -196,8 +196,9 @@ impl ChannelManager {
             })
             .map_err(JDCError::shutdown)?;
 
-        // Drop jobs from any previous bridge session.
+        // Drop jobs / seen-share set from any previous bridge session.
         self.bridge_job_map.retain(|_, r| r.epoch == epoch);
+        let _ = self.bridge_seen_shares.with(|s| s.clear());
 
         self.active_bridge_work
             .with(|work| {

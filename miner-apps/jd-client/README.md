@@ -148,9 +148,10 @@ upstream_tip_work_timeout_secs = 30
 | Local `SetNewPrevHash` (tip catch-up) | Exit bridge and switch to local work (soft cutover) |
 | Timeout | Exit bridge, **re-announce last local tip** to miners, and **re-sync JD** |
 
-Bridge shares: validated against the **downstream (vardiff) target** for miner ack/vardiff, and
-**independently** against the upstream pool target for forwarding. Pool-only rejects no longer
-produce spurious `invalid-share` to the miner. Bridged solutions go to the pool only (not JDS/TP).
+Bridge shares: validated against the **downstream (vardiff) target** for miner ack/vardiff, with
+**duplicate-hash rejection** for the bridge session; then **independently** against the upstream
+pool target for forwarding. Pool-only rejects no longer produce spurious `invalid-share` to the
+miner. Bridged solutions go to the pool only (not JDS/TP).
 
 **Note:** Tip comparison uses local tip history (not full `getblockheader` parent proofs):
 

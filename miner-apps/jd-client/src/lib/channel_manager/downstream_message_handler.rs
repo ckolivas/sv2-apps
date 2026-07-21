@@ -1712,6 +1712,15 @@ impl ChannelManager {
             return Ok(());
         }
 
+        let share_hash_bytes: [u8; 32] = *share_hash.as_ref();
+        if !self.note_bridge_share(share_hash_bytes) {
+            messages.push((downstream_id, build_error("duplicate-share")).into());
+            for message in messages {
+                let _ = message.forward(&self.channel_manager_io).await;
+            }
+            return Ok(());
+        }
+
         let _ = self.vardiff.with_mut(&(downstream_id, channel_id).into(), |vd| {
             vd.increment_shares_since_last_update();
         });
@@ -1719,7 +1728,7 @@ impl ChannelManager {
             "Bridge share valid on downstream target | channel_id: {}, sequence_number: {}, share_hash: {} ☑️",
             channel_id, msg.sequence_number, share_hash
         );
-        // Bridge path does not own server job-store accounting; acknowledge each valid share.
+        // Bridge path does not own server job-store batching; acknowledge each unique valid share.
         let success = SubmitSharesSuccess {
             channel_id,
             last_sequence_number: msg.sequence_number,
@@ -1869,6 +1878,15 @@ impl ChannelManager {
 
         if !Self::bridge_share_meets_downstream_target(share_hash, &channel_target) {
             messages.push((downstream_id, build_error("difficulty-too-low")).into());
+            for message in messages {
+                let _ = message.forward(&self.channel_manager_io).await;
+            }
+            return Ok(());
+        }
+
+        let share_hash_bytes: [u8; 32] = *share_hash.as_ref();
+        if !self.note_bridge_share(share_hash_bytes) {
+            messages.push((downstream_id, build_error("duplicate-share")).into());
             for message in messages {
                 let _ = message.forward(&self.channel_manager_io).await;
             }

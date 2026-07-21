@@ -1,7 +1,7 @@
 #[cfg(feature = "monitoring")]
 use std::net::IpAddr;
 use std::{
-    collections::{BinaryHeap, VecDeque},
+    collections::{BinaryHeap, HashSet, VecDeque},
     net::SocketAddr,
     sync::{
         atomic::{AtomicU32, AtomicUsize, Ordering},
@@ -388,6 +388,8 @@ pub struct ChannelManager {
     pub recent_local_tips: SharedLock<Vec<[u8; 32]>>,
     /// Downstream job ids minted while bridging → pool job reference.
     pub bridge_job_map: SharedMap<DownstreamChannelJobId, BridgeJobRef>,
+    /// Share hashes accepted on the bridge path (duplicate detection; flushed each session).
+    pub bridge_seen_shares: SharedLock<HashSet<[u8; 32]>>,
     /// Local job id allocator for bridge jobs.
     pub bridge_job_id_factory: Arc<AtomicU32>,
     /// Increments each time a new bridge session starts (timeout safety).
@@ -411,6 +413,9 @@ impl ChannelManager {
         self.template_id_to_upstream_job_id.clear();
         self.downstream_channel_id_and_job_id_to_template_id.clear();
         self.bridge_job_map.clear();
+        self.bridge_seen_shares
+            .with(|s| s.clear())
+            .map_err(JDCError::shutdown)?;
         self.pending_downstream_requests
             .with(|pending| pending.clear())
             .map_err(JDCError::shutdown)?;
@@ -606,6 +611,7 @@ impl ChannelManager {
             active_bridge_work: SharedLock::new(None),
             recent_local_tips: SharedLock::new(Vec::new()),
             bridge_job_map: SharedMap::new(),
+            bridge_seen_shares: SharedLock::new(HashSet::new()),
             bridge_job_id_factory: Arc::new(AtomicU32::new(1)),
             bridge_epoch_factory: Arc::new(AtomicU32::new(1)),
             #[cfg(feature = "monitoring")]
@@ -1052,6 +1058,7 @@ impl ChannelManager {
             self.bridge_job_map.retain(|_, r| r.epoch != epoch);
             let _ = self.pending_upstream_job.with(|j| *j = None);
             let _ = self.active_bridge_work.with(|w| *w = None);
+            let _ = self.bridge_seen_shares.with(|s| s.clear());
             info!(epoch, "{reason}");
         }
     }
@@ -1076,8 +1083,16 @@ impl ChannelManager {
             self.bridge_job_map.retain(|_, r| r.epoch != epoch);
             let _ = self.pending_upstream_job.with(|j| *j = None);
             let _ = self.active_bridge_work.with(|w| *w = None);
+            let _ = self.bridge_seen_shares.with(|s| s.clear());
             info!(epoch, "{reason}");
         }
+    }
+
+    /// Record a bridge share hash. Returns `false` if it was already seen (duplicate).
+    pub(crate) fn note_bridge_share(&self, share_hash: [u8; 32]) -> bool {
+        self.bridge_seen_shares
+            .with(|seen| seen.insert(share_hash))
+            .unwrap_or(false)
     }
 
     /// Build downstream mining messages for one **extended** channel from bridge work.
