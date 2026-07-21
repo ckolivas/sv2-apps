@@ -499,6 +499,14 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         // Local tip catch-up ends bridge mode (soft cutover to local JD work).
         // Prefer this over fee-bump NewTemplates, which may still be on the old tip.
         let new_local_tip = msg.prev_hash.to_array();
+        // Soft cutover: we were bridging and the local tip caught up to the SAME pool
+        // tip the downstreams are already mining (via the bridge). In that case the
+        // downstreams are already on this prev_hash, so re-issuing a SetNewPrevHash to
+        // them is a redundant flush (and churns the downstream connections). Instead we
+        // still advance our own channels but hand the downstreams the local job as a
+        // non-flushing NewExtendedMiningJob/NewMiningJob update, keeping their channels
+        // and in-flight work intact.
+        let mut soft_cutover = false;
         if self.is_bridging() {
             let bridge_prev = self
                 .work_source
@@ -512,7 +520,8 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                 .flatten();
 
             let reason = if bridge_prev == Some(new_local_tip) {
-                "local tip caught up to pool tip — exiting upstream tip bridge (clean=false cutover)"
+                soft_cutover = true;
+                "local tip caught up to pool tip — soft cutover (in-place job swap, no downstream flush)"
             } else {
                 "local tip advanced — exiting upstream tip bridge (clean=false cutover)"
             };
@@ -639,27 +648,31 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         }
 
         self.downstream.try_for_each(|downstream_id, downstream| {
-            let (group_channel_id, activated_group_job_id, empty_group_channel) = downstream
-                .group_channel
-                .with(|group_channel| {
-                    group_channel
-                        .on_set_new_prev_hash(msg.clone().into_static())
-                        .map_err(|e| {
-                            tracing::error!(
-                                "Error while adding new prev hash to group channel: {e:?}"
-                            );
-                            JDCError::fallback(e)
-                        })?;
-                    Ok::<_, Self::Error>((
-                        group_channel.get_group_channel_id(),
+            let (group_channel_id, activated_group_job_id, group_job_message, empty_group_channel) =
+                downstream
+                    .group_channel
+                    .with(|group_channel| {
                         group_channel
+                            .on_set_new_prev_hash(msg.clone().into_static())
+                            .map_err(|e| {
+                                tracing::error!(
+                                    "Error while adding new prev hash to group channel: {e:?}"
+                                );
+                                JDCError::fallback(e)
+                            })?;
+                        let group_channel_id = group_channel.get_group_channel_id();
+                        let is_empty = group_channel.is_empty();
+                        let active_job = group_channel
                             .get_active_job()
-                            .expect("active job must exist")
-                            .get_job_id(),
-                        group_channel.is_empty(),
-                    ))
-                })
-                .map_err(JDCError::shutdown)??;
+                            .expect("active job must exist");
+                        Ok::<_, Self::Error>((
+                            group_channel_id,
+                            active_job.get_job_id(),
+                            active_job.get_job_message().clone(),
+                            is_empty,
+                        ))
+                    })
+                    .map_err(JDCError::shutdown)??;
 
             let requires_standard_jobs = downstream.require_std_job.load(Ordering::Relaxed);
             if !requires_standard_jobs && !empty_group_channel {
@@ -676,19 +689,28 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                     );
                 });
 
-                messages.push(
-                    (
-                        downstream_id,
-                        Mining::SetNewPrevHash(SetNewPrevHashMp {
-                            channel_id: group_channel_id,
-                            job_id: activated_group_job_id,
-                            prev_hash: msg.prev_hash.clone(),
-                            min_ntime: msg.header_timestamp,
-                            nbits: msg.n_bits,
-                        }),
-                    )
-                        .into(),
-                );
+                if soft_cutover {
+                    // Same tip: downstreams already hold this prev_hash from the bridge.
+                    // Swap in our own job as a non-flushing NewExtendedMiningJob instead
+                    // of re-issuing SetNewPrevHash (avoids a redundant downstream flush).
+                    messages.push(
+                        (downstream_id, Mining::NewExtendedMiningJob(group_job_message)).into(),
+                    );
+                } else {
+                    messages.push(
+                        (
+                            downstream_id,
+                            Mining::SetNewPrevHash(SetNewPrevHashMp {
+                                channel_id: group_channel_id,
+                                job_id: activated_group_job_id,
+                                prev_hash: msg.prev_hash.clone(),
+                                min_ntime: msg.header_timestamp,
+                                nbits: msg.n_bits,
+                            }),
+                        )
+                            .into(),
+                    );
+                }
             }
 
             downstream
@@ -704,27 +726,35 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                         })?;
 
                     if requires_standard_jobs {
-                        let activated_standard_job_id = standard_channel
+                        let active_job = standard_channel
                             .get_active_job()
-                            .expect("active job must exist")
-                            .get_job_id();
+                            .expect("active job must exist");
+                        let activated_standard_job_id = active_job.get_job_id();
+                        let standard_job_message = active_job.get_job_message().clone();
                         self.downstream_channel_id_and_job_id_to_template_id.insert(
                             (downstream_id, channel_id, activated_standard_job_id).into(),
                             msg.template_id,
                         );
-                        messages.push(
-                            (
-                                downstream_id,
-                                Mining::SetNewPrevHash(SetNewPrevHashMp {
-                                    channel_id,
-                                    job_id: activated_standard_job_id,
-                                    prev_hash: msg.prev_hash.clone(),
-                                    min_ntime: msg.header_timestamp,
-                                    nbits: msg.n_bits,
-                                }),
-                            )
-                                .into(),
-                        );
+                        if soft_cutover {
+                            // Same tip: non-flushing job swap, no SetNewPrevHash re-issue.
+                            messages.push(
+                                (downstream_id, Mining::NewMiningJob(standard_job_message)).into(),
+                            );
+                        } else {
+                            messages.push(
+                                (
+                                    downstream_id,
+                                    Mining::SetNewPrevHash(SetNewPrevHashMp {
+                                        channel_id,
+                                        job_id: activated_standard_job_id,
+                                        prev_hash: msg.prev_hash.clone(),
+                                        min_ntime: msg.header_timestamp,
+                                        nbits: msg.n_bits,
+                                    }),
+                                )
+                                    .into(),
+                            );
+                        }
                     }
                     Ok::<(), Self::Error>(())
                 })?;
