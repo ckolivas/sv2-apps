@@ -68,6 +68,8 @@ pub struct DownstreamData {
     pub channel_id: Option<ChannelId>,
     pub extranonce1: Extranonce<'static>,
     pub extranonce2_len: usize,
+    // Current SV1 share-validation target. This follows the advertised
+    // difficulty sent to the miner, including any SV1 pow2 rounding.
     pub target: Target,
     pub hashrate: Option<Hashrate>,
     #[cfg(feature = "monitoring")]
@@ -79,6 +81,8 @@ pub struct DownstreamData {
     pub user_identity: String,
     pub cached_set_difficulty: Option<json_rpc::Message>,
     pub cached_notify: Option<json_rpc::Message>,
+    // Next advertised SV1 target, applied when the corresponding
+    // mining.set_difficulty is sent with a new mining.notify.
     pub pending_target: Option<Target>,
     pub pending_hashrate: Option<Hashrate>,
     pub stable_hashrate: bool,
@@ -86,7 +90,8 @@ pub struct DownstreamData {
     pub queued_sv1_handshake_messages: Vec<json_rpc::Message>,
     // Stores pending shares to be sent to the sv1_server
     pub pending_share: Option<SubmitShareWithChannelId>,
-    // Tracks the upstream target for this downstream, used for vardiff target comparison
+    // Exact target currently accepted upstream, used to decide whether a
+    // stricter downstream difficulty must wait for a SetTarget response.
     pub upstream_target: Option<Target>,
     // Timestamp of when the last job was received by this downstream, used for keepalive check
     pub last_job_received_time: Option<Instant>,

@@ -10,7 +10,10 @@ use stratum_apps::{
         channels_sv2::{target::hash_rate_to_target, Vardiff},
         mining_sv2::{SetTarget, UpdateChannel},
         parsers_sv2::Mining,
-        stratum_translation::sv2_to_sv1::build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding,
+        stratum_translation::sv2_to_sv1::{
+            build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding,
+            sv1_advertised_target_from_sv2_target,
+        },
     },
     utils::types::{ChannelId, DownstreamId, Hashrate},
 };
@@ -102,7 +105,16 @@ impl Sv1Server {
                 // Always update the downstream's pending target and hashrate
                 if let Some(d) = self.downstreams.get(downstream_id) {
                     _ = d.downstream_data.safe_lock(|data| {
-                        data.set_pending_target(new_target, d.downstream_id);
+                        // Store the advertised (pow2 rounded) target so share
+                        // validation matches the difficulty the miner was sent.
+                        data.set_pending_target(
+                            sv1_advertised_target_from_sv2_target(
+                                new_target,
+                                SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
+                            )
+                            .unwrap_or(new_target),
+                            d.downstream_id,
+                        );
                         data.set_pending_hashrate(Some(new_hashrate), d.downstream_id);
                         data.stable_hashrate = false;
                     });
@@ -227,25 +239,41 @@ impl Sv1Server {
 
         let mut min_target: Option<Target> = None;
         let mut total_hashrate: Hashrate = 0.0;
+        let shares_per_minute = self.shares_per_minute as f64;
 
         for downstream in self.downstreams.iter() {
+            let downstream_id = *downstream.key();
             let downstream = downstream.value();
-            downstream.downstream_data.super_safe_lock(|d| {
-                let target = *d.pending_target.as_ref().unwrap_or(&d.target);
-                let hashrate = d
-                    .pending_hashrate
-                    .unwrap_or_else(|| d.hashrate.expect("vardiff implies hashrate"));
-
-                min_target = Some(match min_target {
-                    Some(current) => current.min(target),
-                    None => target,
-                });
-
-                total_hashrate += hashrate;
+            let hashrate = downstream.downstream_data.super_safe_lock(|d| {
+                d.pending_hashrate
+                    .unwrap_or_else(|| d.hashrate.expect("vardiff implies hashrate"))
             });
+
+            // UpdateChannel is upstream-facing, so rebuild the exact target from
+            // hashrate instead of reusing the rounded SV1 advertised target.
+            let target = match hash_rate_to_target(hashrate as f64, shares_per_minute) {
+                Ok(target) => target,
+                Err(e) => {
+                    error!(
+                        "Failed to calculate exact target for downstream {} hashrate {}: {:?}",
+                        downstream_id, hashrate, e
+                    );
+                    continue;
+                }
+            };
+
+            min_target = Some(match min_target {
+                Some(current) => current.min(target),
+                None => target,
+            });
+
+            total_hashrate += hashrate;
         }
 
-        let min_target = min_target.expect("at least one downstream must exist");
+        let Some(min_target) = min_target else {
+            warn!("Skipping aggregated UpdateChannel: no exact downstream target is available");
+            return;
+        };
         let downstream_count = self.downstreams.len();
 
         let update_channel = UpdateChannel {
@@ -484,28 +512,48 @@ impl Sv1Server {
         } else {
             let mut total_hashrate: Hashrate = 0.0;
             let mut min_target: Option<Target> = None;
+            let shares_per_minute = self.shares_per_minute as f64;
 
             for downstream in self.downstreams.iter() {
+                let downstream_id = *downstream.key();
                 let downstream = downstream.value();
-                downstream.downstream_data.super_safe_lock(|d| {
-                    let hashrate = d.pending_hashrate.unwrap_or_else(|| {
+                let hashrate = downstream.downstream_data.super_safe_lock(|d| {
+                    d.pending_hashrate.unwrap_or_else(|| {
                         d.hashrate
                             .expect("vardiff implies downstream must have a hashrate")
-                    });
+                    })
+                });
 
-                    let target = *d.pending_target.as_ref().unwrap_or(&d.target);
+                // UpdateChannel is upstream-facing, so rebuild the exact target from
+                // hashrate instead of reusing the rounded SV1 advertised target.
+                let target = match hash_rate_to_target(hashrate as f64, shares_per_minute) {
+                    Ok(target) => target,
+                    Err(e) => {
+                        error!(
+                            "Failed to calculate exact target for downstream {} hashrate {}: {:?}",
+                            downstream_id, hashrate, e
+                        );
+                        continue;
+                    }
+                };
 
-                    total_hashrate += hashrate;
-                    min_target = Some(match min_target {
-                        Some(current) => current.min(target),
-                        None => target,
-                    });
+                total_hashrate += hashrate;
+                min_target = Some(match min_target {
+                    Some(current) => current.min(target),
+                    None => target,
                 });
             }
 
+            let Some(min_target) = min_target else {
+                warn!(
+                    "Skipping aggregated UpdateChannel after downstream state change: no exact downstream target is available"
+                );
+                return;
+            };
+
             AggregatedSnapshot::Active {
                 total_hashrate,
-                min_target: min_target.expect("downstreams is non-empty"),
+                min_target,
             }
         };
 

@@ -65,6 +65,7 @@ use stratum_apps::{
             sv2_to_sv1::{
                 build_sv1_notify_from_sv2,
                 build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding,
+                sv1_advertised_target_from_sv2_target,
             },
         },
         sv1_api::{json_rpc, server_to_client, utils::HexU32Be, IsServer},
@@ -1205,7 +1206,17 @@ impl Sv1Server {
                 let has_channel = entry.value().downstream_data.super_safe_lock(|d| {
                     let channel_id = d.channel_id?;
                     d.set_upstream_target(target, downstream_id);
-                    d.set_pending_target(target, downstream_id);
+                    // Downstream validation must use the advertised (pow2
+                    // rounded) difficulty; upstream_target keeps the exact
+                    // pool target for vardiff comparisons.
+                    d.set_pending_target(
+                        sv1_advertised_target_from_sv2_target(
+                            target,
+                            SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
+                        )
+                        .unwrap_or(target),
+                        downstream_id,
+                    );
                     if let Some(hr) = derived_hashrate {
                         d.set_pending_hashrate(Some(hr as f32), downstream_id);
                     }
@@ -1297,7 +1308,16 @@ impl Sv1Server {
         };
         downstream.downstream_data.super_safe_lock(|d| {
             d.set_upstream_target(target, downstream_id);
-            d.set_pending_target(target, downstream_id);
+            // See send_set_difficulty_to_all_downstreams: downstream validation
+            // uses the advertised pow2 difficulty.
+            d.set_pending_target(
+                sv1_advertised_target_from_sv2_target(
+                    target,
+                    SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
+                )
+                .unwrap_or(target),
+                downstream_id,
+            );
             // Update pending hashrate derived from the upstream target
             if let Some(hr) = derived_hashrate {
                 d.set_pending_hashrate(Some(hr as f32), downstream_id);

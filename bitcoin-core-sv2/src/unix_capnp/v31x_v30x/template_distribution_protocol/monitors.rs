@@ -1,6 +1,7 @@
 // Shared monitor implementation included by v30.x and v31.x TDP modules.
 
 use super::{BitcoinCoreSv2TDP, bitcoin_capnp_types::capnp};
+use crate::{MAX_MONEY, WAIT_NEXT_TIMEOUT_MS};
 use stratum_core::parsers_sv2::TemplateDistribution;
 use tracing::{debug, error, info, warn};
 
@@ -49,9 +50,42 @@ impl BitcoinCoreSv2TDP {
             loop {
                 debug!("monitor_ipc_templates() loop iteration start");
 
+                // Fee-driven template updates are throttled by suppressing fee-based `waitNext`
+                // wakeups while the `min_interval` window is active: the `fee_threshold` is raised
+                // to MAX_MONEY, so Bitcoin Core only returns early on a chain tip change (or when
+                // the timeout expires).
+                //
+                // A `waitNext` request is always outstanding (the loop never sleeps), so chain tip
+                // changes are always detected immediately.
+                let (fee_threshold, timeout_ms) = match self_clone.last_sent_template_instant {
+                    Some(last_sent_template_instant) => {
+                        let elapsed_ms = last_sent_template_instant.elapsed().as_millis();
+                        let min_interval_ms = self_clone.min_interval as u128 * 1_000;
+
+                        if elapsed_ms < min_interval_ms {
+                            // Safe cast: min_interval is u8 (max 255), so remaining_ms is at most
+                            // 255,000 ms, which fits comfortably in f64
+                            let remaining_ms = (min_interval_ms - elapsed_ms) as f64;
+                            debug!(
+                                "Throttling fee-based template updates for {} more milliseconds (waiting only for chain tip changes)",
+                                remaining_ms
+                            );
+                            (MAX_MONEY, remaining_ms.min(WAIT_NEXT_TIMEOUT_MS))
+                        } else {
+                            (self_clone.fee_threshold as i64, WAIT_NEXT_TIMEOUT_MS)
+                        }
+                    }
+                    None => (self_clone.fee_threshold as i64, WAIT_NEXT_TIMEOUT_MS),
+                };
+
                 // Create a new request for each iteration
                 let wait_next_request = match self_clone
-                    .new_wait_next_request(&template_ipc_client, blocking_thread_ipc_client.clone())
+                    .new_wait_next_request(
+                        &template_ipc_client,
+                        blocking_thread_ipc_client.clone(),
+                        fee_threshold,
+                        timeout_ms,
+                    )
                     .await
                 {
                     Ok(wait_next_request) => wait_next_request,
@@ -167,21 +201,10 @@ impl BitcoinCoreSv2TDP {
                                         }
                                     }
                                 } else {
-                                    // check if the minimum interval has been reached
-                                    if let Some(last_sent_template_instant) = self_clone.last_sent_template_instant {
-                                        let elapsed = last_sent_template_instant.elapsed().as_millis();
-                                        let min_interval_millis = self_clone.min_interval as u128 * 1_000;
-
-                                        // if the minimum interval has not been reached, sleep for the remaining time
-                                        if elapsed < min_interval_millis {
-                                            let sleep_duration = min_interval_millis - elapsed;
-                                            // Safe cast: min_interval is u8 (max 255), so sleep_duration is at most 255,000 ms,
-                                            // which fits comfortably in u64 (max: 18,446,744,073,709,551,615)
-                                            debug!("Sleeping for {} milliseconds to reach the minimum interval", sleep_duration);
-                                            tokio::time::sleep(std::time::Duration::from_millis(sleep_duration as u64)).await;
-                                        }
-                                    }
-
+                                    // Fee-driven template updates are throttled upstream via the
+                                    // waitNext fee_threshold (see the top of the loop), so by the
+                                    // time a fee-update template is returned here, the min_interval
+                                    // window has already expired.
                                     info!("💹 Mempool fees increased! Sending NewTemplate message.");
                                     debug!("MEMPOOL FEE CHANGE DETECTED - sending non-future template");
 

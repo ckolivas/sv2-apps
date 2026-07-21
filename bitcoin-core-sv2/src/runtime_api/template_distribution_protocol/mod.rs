@@ -10,7 +10,9 @@
 //!   `SetNewPrevHash`, and transaction-data responses).
 //!
 //! `fee_threshold` controls template refreshes driven by mempool fee deltas, while `min_interval`
-//! enforces a minimum spacing between mempool-driven template updates.
+//! enforces a minimum spacing between mempool-driven template updates. Chain tip updates are never
+//! throttled: while inside the `min_interval` window, `waitNext` requests are issued with
+//! `fee_threshold = MAX_MONEY` so Bitcoin Core only wakes the monitor for a chain tip change.
 
 use crate::{
     runtime_api::{BitcoinCoreSv2Error, BitcoinCoreSv2Protocol, BitcoinCoreVersion},

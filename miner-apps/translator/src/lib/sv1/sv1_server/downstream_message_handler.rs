@@ -154,7 +154,7 @@ impl IsServer<'static> for Sv1Server {
                 data.target,
                 data.extranonce1.clone().into(),
                 data.version_rolling_mask.clone(),
-                job,
+                job.clone(),
             )
             .unwrap_or(false);
 

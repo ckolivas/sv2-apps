@@ -55,7 +55,8 @@ const MIN_BLOCK_RESERVED_WEIGHT: u64 = 2000;
 /// It is instantiated with:
 /// - A `&`[`std::path::Path`] to the Bitcoin Core UNIX socket
 /// - A `u64` for the fee delta threshold in satoshis
-/// - A `u8` for the minimum interval in seconds between template updates
+/// - A `u8` for the minimum interval in seconds between mempool-driven template updates
+///   (chain tip updates are never throttled)
 /// - A [`async_channel::Receiver`] for incoming [`TemplateDistribution`] messages (handles
 ///   [`CoinbaseOutputConstraints`],
 ///   [`stratum_core::template_distribution_sv2::RequestTransactionData`], and
@@ -591,6 +592,8 @@ impl BitcoinCoreSv2TDP {
         &self,
         template_ipc_client: &BlockTemplateIpcClient,
         thread_ipc_client: ThreadIpcClient,
+        fee_threshold: i64,
+        timeout_ms: f64,
     ) -> Result<Request<WaitNextParams, WaitNextResults>, BitcoinCoreSv2TDPError> {
         let mut wait_next_request = template_ipc_client.wait_next_request();
 
@@ -610,12 +613,11 @@ impl BitcoinCoreSv2TDP {
             }
         };
 
-        wait_next_request_options.set_fee_threshold(self.fee_threshold as i64);
+        wait_next_request_options.set_fee_threshold(fee_threshold);
 
-        // 10 seconds timeout for waitNext requests
-        // please note that this is NOT how often we expect to get new templates
+        // the timeout is NOT how often we expect to get new templates
         // it's just the max time we'll wait for the current waitNext request to complete
-        wait_next_request_options.set_timeout(10_000.0);
+        wait_next_request_options.set_timeout(timeout_ms);
 
         Ok(wait_next_request)
     }
