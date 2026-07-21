@@ -175,7 +175,7 @@ impl ChannelManager {
             .await
     }
 
-    /// Fan out rewritten pool work to all connected downstream extended channels.
+    /// Fan out rewritten pool work to all connected downstream extended **and** standard channels.
     async fn fanout_bridge_job_to_downstreams(
         &mut self,
         pool_job: &NewExtendedMiningJob<'static>,
@@ -186,11 +186,19 @@ impl ChannelManager {
         let mut messages: Vec<RouteMessageTo> = Vec::new();
         let pool_job_id = pool_job.job_id;
 
-        // Collect (downstream_id, channel_id, prefix) first so we do not re-enter maps.
-        let mut targets: Vec<(usize, u32, Vec<u8>)> = Vec::new();
+        // Collect targets first so we do not re-enter maps while minting.
+        let mut extended_targets: Vec<(usize, u32, Vec<u8>)> = Vec::new();
+        let mut standard_targets: Vec<(usize, u32, Vec<u8>)> = Vec::new();
         self.downstream.for_each(|downstream_id, downstream| {
             downstream.extended_channels.for_each(|channel_id, channel| {
-                targets.push((
+                extended_targets.push((
+                    downstream_id,
+                    channel_id,
+                    channel.get_extranonce_prefix().to_vec(),
+                ));
+            });
+            downstream.standard_channels.for_each(|channel_id, channel| {
+                standard_targets.push((
                     downstream_id,
                     channel_id,
                     channel.get_extranonce_prefix().to_vec(),
@@ -198,7 +206,7 @@ impl ChannelManager {
             });
         });
 
-        for (downstream_id, channel_id, prefix) in targets {
+        for (downstream_id, channel_id, prefix) in extended_targets {
             match self.mint_bridge_job_for_channel(
                 pool_job,
                 snph,
@@ -213,7 +221,33 @@ impl ChannelManager {
                     messages.push((downstream_id, Mining::SetNewPrevHash(set_prev)).into());
                 }
                 Err(e) => {
-                    error!(?e, channel_id, "Failed to mint bridge job for downstream");
+                    error!(
+                        ?e,
+                        channel_id, "Failed to mint bridge job for extended downstream"
+                    );
+                }
+            }
+        }
+
+        for (downstream_id, channel_id, prefix) in standard_targets {
+            match self.mint_bridge_standard_job_for_channel(
+                pool_job,
+                snph,
+                epoch,
+                pool_prev,
+                downstream_id,
+                channel_id,
+                &prefix,
+            ) {
+                Ok((job, set_prev)) => {
+                    messages.push((downstream_id, Mining::NewMiningJob(job)).into());
+                    messages.push((downstream_id, Mining::SetNewPrevHash(set_prev)).into());
+                }
+                Err(e) => {
+                    error!(
+                        ?e,
+                        channel_id, "Failed to mint bridge job for standard downstream"
+                    );
                 }
             }
         }

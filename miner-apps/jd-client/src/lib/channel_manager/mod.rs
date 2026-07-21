@@ -20,9 +20,11 @@ use stratum_apps::{
     network_helpers::accept_noise_connection,
     stratum_core::{
         bitcoin::{consensus, Amount, Target, TxOut},
+        binary_sv2::{Sv2Option, B064K, U256},
         channels_sv2::{
             client::extended::ExtendedChannel,
             extranonce_manager::{bytes_needed, ExtranonceAllocator},
+            merkle_root::merkle_root_from_path,
             outputs::deserialize_outputs,
             server::{group::GroupChannel, jobs::factory::JobFactory, standard::StandardChannel},
             Vardiff, VardiffState,
@@ -36,10 +38,9 @@ use stratum_apps::{
         job_declaration_sv2::{
             AllocateMiningJobToken, AllocateMiningJobTokenSuccess, DeclareMiningJob,
         },
-        binary_sv2::{Sv2Option, B064K},
         mining_sv2::{
-            NewExtendedMiningJob, OpenExtendedMiningChannel, SetCustomMiningJob, SetNewPrevHash,
-            SetTarget, UpdateChannel,
+            NewExtendedMiningJob, NewMiningJob, OpenExtendedMiningChannel, SetCustomMiningJob,
+            SetNewPrevHash, SetTarget, UpdateChannel,
         },
         parsers_sv2::{AnyMessage, JobDeclaration, Mining, TemplateDistribution, Tlv},
         template_distribution_sv2::{
@@ -1074,7 +1075,7 @@ impl ChannelManager {
         }
     }
 
-    /// Build downstream mining messages for one channel from active (or provided) bridge work.
+    /// Build downstream mining messages for one **extended** channel from bridge work.
     ///
     /// Returns `(NewExtendedMiningJob, SetNewPrevHash)` ready to send, and registers the
     /// local job id in [`Self::bridge_job_map`].
@@ -1096,15 +1097,14 @@ impl ChannelManager {
             channel_extranonce_prefix,
             Some(snph.min_ntime),
         )?;
-        self.bridge_job_map.insert(
-            (downstream_id, channel_id, local_job_id).into(),
-            BridgeJobRef {
-                pool_job_id: pool_job.job_id,
-                pool_prev_hash: pool_prev,
-                pool_nbits: snph.nbits,
-                pool_min_ntime: snph.min_ntime,
-                epoch,
-            },
+        self.register_bridge_job(
+            downstream_id,
+            channel_id,
+            local_job_id,
+            pool_job.job_id,
+            pool_prev,
+            snph,
+            epoch,
         );
         let set_prev = SetNewPrevHash {
             channel_id,
@@ -1114,6 +1114,69 @@ impl ChannelManager {
             nbits: snph.nbits,
         };
         Ok((job, set_prev))
+    }
+
+    /// Build downstream mining messages for one **standard** channel from bridge work.
+    ///
+    /// Converts the pool extended job into a [`NewMiningJob`] using the channel's full
+    /// fixed extranonce prefix (standard prefixes are total-length and zero-padded).
+    pub(crate) fn mint_bridge_standard_job_for_channel(
+        &self,
+        pool_job: &NewExtendedMiningJob<'static>,
+        snph: &SetNewPrevHash<'static>,
+        epoch: u64,
+        pool_prev: [u8; 32],
+        downstream_id: DownstreamId,
+        channel_id: ChannelId,
+        channel_extranonce_prefix: &[u8],
+    ) -> Result<(NewMiningJob<'static>, SetNewPrevHash<'static>), JDCErrorKind> {
+        let local_job_id = self.bridge_job_id_factory.fetch_add(1, Ordering::Relaxed);
+        let job = Self::standard_job_from_pool_job(
+            pool_job,
+            channel_id,
+            local_job_id,
+            channel_extranonce_prefix,
+            Some(snph.min_ntime),
+        )?;
+        self.register_bridge_job(
+            downstream_id,
+            channel_id,
+            local_job_id,
+            pool_job.job_id,
+            pool_prev,
+            snph,
+            epoch,
+        );
+        let set_prev = SetNewPrevHash {
+            channel_id,
+            job_id: local_job_id,
+            prev_hash: snph.prev_hash.clone().into_static(),
+            min_ntime: snph.min_ntime,
+            nbits: snph.nbits,
+        };
+        Ok((job, set_prev))
+    }
+
+    fn register_bridge_job(
+        &self,
+        downstream_id: DownstreamId,
+        channel_id: ChannelId,
+        local_job_id: JobId,
+        pool_job_id: UpstreamJobId,
+        pool_prev: [u8; 32],
+        snph: &SetNewPrevHash<'static>,
+        epoch: u64,
+    ) {
+        self.bridge_job_map.insert(
+            (downstream_id, channel_id, local_job_id).into(),
+            BridgeJobRef {
+                pool_job_id,
+                pool_prev_hash: pool_prev,
+                pool_nbits: snph.nbits,
+                pool_min_ntime: snph.min_ntime,
+                epoch,
+            },
+        );
     }
 
     /// Rewrite a pool `NewExtendedMiningJob` so a downstream channel rolls only its own slice.
@@ -1149,6 +1212,34 @@ impl ChannelManager {
             merkle_path: pool_job.merkle_path.clone().into_static(),
             coinbase_tx_prefix: prefix,
             coinbase_tx_suffix: suffix,
+        })
+    }
+
+    /// Convert a pool extended job into a standard [`NewMiningJob`] for a fixed extranonce prefix.
+    pub(crate) fn standard_job_from_pool_job(
+        pool_job: &NewExtendedMiningJob<'static>,
+        channel_id: ChannelId,
+        local_job_id: JobId,
+        channel_extranonce_prefix: &[u8],
+        min_ntime: Option<u32>,
+    ) -> Result<NewMiningJob<'static>, JDCErrorKind> {
+        let merkle_root = merkle_root_from_path(
+            &pool_job.coinbase_tx_prefix.to_owned_bytes(),
+            &pool_job.coinbase_tx_suffix.to_owned_bytes(),
+            channel_extranonce_prefix,
+            pool_job.merkle_path.as_slice(),
+        )
+        .ok_or(JDCErrorKind::CustomJobError)?;
+        let merkle_root: U256<'static> = merkle_root
+            .try_into()
+            .map_err(|_| JDCErrorKind::CustomJobError)?;
+
+        Ok(NewMiningJob {
+            channel_id,
+            job_id: local_job_id,
+            min_ntime: Sv2Option::new(min_ntime),
+            version: pool_job.version,
+            merkle_root,
         })
     }
 

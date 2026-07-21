@@ -342,51 +342,103 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         .into(),
                 );
 
-                standard_channel
-                    .on_new_template(last_future_template.clone(), coinbase_outputs.clone())
-                    .map_err(|e| {
-                        error!(?e, "Failed to apply template to standard channel");
-                        JDCError::shutdown(e)
-                    })?;
+                // While bridging pool tip work, give late joiners the active bridge job
+                // instead of (stale) local tip templates.
+                let bridge_work = self
+                    .active_bridge_work
+                    .with(|w| w.clone())
+                    .map_err(JDCError::shutdown)?;
+                let mut sent_bridge_job = false;
 
-                let future_standard_job_id = standard_channel
-                    .get_future_job_id_from_template_id(last_future_template.template_id)
-                    .expect("future job id must exist");
-                let future_standard_job_message = standard_channel
-                    .get_future_job(future_standard_job_id)
-                    .expect("future job must exist")
-                    .get_job_message()
-                    .clone()
-                    .into_static();
-                messages.push(
-                    (
-                        downstream_id,
-                        Mining::NewMiningJob(future_standard_job_message),
-                    )
-                        .into(),
-                );
+                if self.is_bridging() {
+                    if let Some(bridge) = bridge_work {
+                        let prefix = standard_channel.get_extranonce_prefix().to_vec();
+                        match self.mint_bridge_standard_job_for_channel(
+                            &bridge.pool_job,
+                            &bridge.snph,
+                            bridge.epoch,
+                            bridge.pool_prev,
+                            downstream_id,
+                            standard_channel_id,
+                            &prefix,
+                        ) {
+                            Ok((job, set_prev)) => {
+                                info!(
+                                    downstream_id,
+                                    channel_id = standard_channel_id,
+                                    epoch = bridge.epoch,
+                                    "Late-joining standard channel receives active upstream tip bridge work"
+                                );
+                                messages.push(
+                                    (downstream_id, Mining::NewMiningJob(job)).into(),
+                                );
+                                messages.push(
+                                    (downstream_id, Mining::SetNewPrevHash(set_prev)).into(),
+                                );
+                                sent_bridge_job = true;
+                            }
+                            Err(e) => {
+                                error!(
+                                    ?e,
+                                    "Failed to mint bridge job for late-joining standard channel; using local tip"
+                                );
+                            }
+                        }
+                    }
+                }
 
-                let set_new_prev_hash_mining = SetNewPrevHash {
-                    channel_id: standard_channel_id,
-                    job_id: future_standard_job_id,
-                    prev_hash: last_new_prev_hash.prev_hash.clone(),
-                    min_ntime: last_new_prev_hash.header_timestamp,
-                    nbits: last_new_prev_hash.n_bits,
-                };
+                if !sent_bridge_job {
+                    standard_channel
+                        .on_new_template(last_future_template.clone(), coinbase_outputs.clone())
+                        .map_err(|e| {
+                            error!(?e, "Failed to apply template to standard channel");
+                            JDCError::shutdown(e)
+                        })?;
 
-                standard_channel
-                    .on_set_new_prev_hash(last_new_prev_hash)
-                    .map_err(|e| {
-                        error!(?e, "Failed to apply prevhash to standard channel");
-                        JDCError::shutdown(e)
-                    })?;
-                messages.push(
-                    (
-                        downstream_id,
-                        Mining::SetNewPrevHash(set_new_prev_hash_mining),
-                    )
-                        .into(),
-                );
+                    let future_standard_job_id = standard_channel
+                        .get_future_job_id_from_template_id(last_future_template.template_id)
+                        .expect("future job id must exist");
+                    let future_standard_job_message = standard_channel
+                        .get_future_job(future_standard_job_id)
+                        .expect("future job must exist")
+                        .get_job_message()
+                        .clone()
+                        .into_static();
+                    messages.push(
+                        (
+                            downstream_id,
+                            Mining::NewMiningJob(future_standard_job_message),
+                        )
+                            .into(),
+                    );
+
+                    let set_new_prev_hash_mining = SetNewPrevHash {
+                        channel_id: standard_channel_id,
+                        job_id: future_standard_job_id,
+                        prev_hash: last_new_prev_hash.prev_hash.clone(),
+                        min_ntime: last_new_prev_hash.header_timestamp,
+                        nbits: last_new_prev_hash.n_bits,
+                    };
+
+                    standard_channel
+                        .on_set_new_prev_hash(last_new_prev_hash)
+                        .map_err(|e| {
+                            error!(?e, "Failed to apply prevhash to standard channel");
+                            JDCError::shutdown(e)
+                        })?;
+                    messages.push(
+                        (
+                            downstream_id,
+                            Mining::SetNewPrevHash(set_new_prev_hash_mining),
+                        )
+                            .into(),
+                    );
+
+                    self.downstream_channel_id_and_job_id_to_template_id.insert(
+                        (downstream_id, standard_channel_id, future_standard_job_id).into(),
+                        last_future_template.template_id,
+                    );
+                }
 
                 self.vardiff.insert(
                     (downstream_id, standard_channel_id).into(),
@@ -395,10 +447,6 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 downstream
                     .standard_channels
                     .insert(standard_channel_id, standard_channel);
-                self.downstream_channel_id_and_job_id_to_template_id.insert(
-                    (downstream_id, standard_channel_id, future_standard_job_id).into(),
-                    last_future_template.template_id,
-                );
 
                 if !downstream.require_std_job.load(Ordering::Relaxed) {
                     downstream
@@ -955,6 +1003,14 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         let downstream_job_id = msg.job_id;
         let downstream_id =
             client_id.expect("client_id must be present for downstream_id extraction");
+
+        // Bridge jobs are not in the server job store — route before local validate_share.
+        let bridge_key = (downstream_id, channel_id, downstream_job_id).into();
+        if let Some(bridge_ref) = self.bridge_job_map.get_cloned(&bridge_key) {
+            return self
+                .handle_bridge_submit_shares_standard(downstream_id, msg, bridge_ref)
+                .await;
+        }
 
         let build_error = |code: &str| {
             Mining::SubmitSharesError(SubmitSharesError {
@@ -1651,6 +1707,132 @@ impl ChannelManager {
         for message in messages {
             if let Err(e) = message.forward(&self.channel_manager_io).await {
                 error!("Failed to forward bridge share message: {e:?}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate and forward a standard-channel share found on pool tip-bridge work.
+    ///
+    /// Converts the standard share into an upstream `SubmitSharesExtended` using the
+    /// channel's fixed extranonce prefix (no miner-rollable slice).
+    async fn handle_bridge_submit_shares_standard(
+        &mut self,
+        downstream_id: DownstreamId,
+        msg: SubmitSharesStandard,
+        bridge_ref: BridgeJobRef,
+    ) -> Result<(), JDCError<error::ChannelManager>> {
+        self.maybe_expire_bridge().await;
+
+        let channel_id = msg.channel_id;
+        let mut messages: Vec<RouteMessageTo> = Vec::new();
+
+        let build_error = |code: &str| {
+            Mining::SubmitSharesError(SubmitSharesError {
+                channel_id,
+                sequence_number: msg.sequence_number,
+                error_code: code.try_into().expect("valid error code"),
+            })
+        };
+
+        let extranonce_prefix = self.downstream.with(&downstream_id, |downstream| {
+            downstream
+                .standard_channels
+                .with(&channel_id, |ch| ch.get_extranonce_prefix().to_vec())
+        });
+
+        let Some(Some(extranonce_prefix)) = extranonce_prefix else {
+            messages.push((downstream_id, build_error("invalid-channel-id")).into());
+            for message in messages {
+                let _ = message.forward(&self.channel_manager_io).await;
+            }
+            return Ok(());
+        };
+
+        // Fully resolve inside the lock so no non-Send poison/error types cross `.await`.
+        let forward_msg: Option<Mining<'static>> =
+            match self.upstream_channel.with(|maybe_upstream| {
+                let Some(upstream_channel) = maybe_upstream.as_mut() else {
+                    return None;
+                };
+
+                let upstream_extranonce_prefix = upstream_channel.get_extranonce_prefix();
+                if extranonce_prefix.len() < upstream_extranonce_prefix.len() {
+                    return None;
+                }
+                // Everything after the pool-assigned upstream prefix is the "rollable" region
+                // from the pool's perspective (local index + zero-pad for standard channels).
+                let mid_prefix = &extranonce_prefix[upstream_extranonce_prefix.len()..];
+                let Ok(en) = mid_prefix.to_vec().try_into() else {
+                    return None;
+                };
+
+                let mut upstream_message = SubmitSharesExtended {
+                    channel_id: upstream_channel.get_channel_id(),
+                    sequence_number: 0,
+                    job_id: bridge_ref.pool_job_id,
+                    nonce: msg.nonce,
+                    ntime: msg.ntime,
+                    version: msg.version,
+                    extranonce: en,
+                };
+
+                match upstream_channel.validate_share(upstream_message.clone()) {
+                    Ok(client::share_accounting::ShareValidationResult::Valid(share_hash)) => {
+                        upstream_message.sequence_number =
+                            self.sequence_number_factory.fetch_add(1, Ordering::Relaxed);
+                        info!(
+                            "Bridge standard share valid → upstream: ch={}, seq={}, hash={} ✅",
+                            channel_id, upstream_message.sequence_number, share_hash
+                        );
+                        Some(Mining::SubmitSharesExtended(upstream_message.into_static()))
+                    }
+                    Ok(client::share_accounting::ShareValidationResult::BlockFound(share_hash)) => {
+                        upstream_message.sequence_number =
+                            self.sequence_number_factory.fetch_add(1, Ordering::Relaxed);
+                        info!(
+                            "Bridge standard share 💰 Block Found!!! 💰{share_hash} — submitting to pool only"
+                        );
+                        Some(Mining::SubmitSharesExtended(upstream_message.into_static()))
+                    }
+                    Err(err) => {
+                        debug!(
+                            ?err,
+                            channel_id, "Bridge standard share rejected by upstream validation"
+                        );
+                        None
+                    }
+                }
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(?e, "Bridge standard share lock failed");
+                    None
+                }
+            };
+
+        match forward_msg {
+            Some(upstream_msg) => {
+                let success = SubmitSharesSuccess {
+                    channel_id,
+                    last_sequence_number: msg.sequence_number,
+                    new_submits_accepted_count: 1,
+                    new_shares_sum: 1,
+                };
+                messages.push((downstream_id, Mining::SubmitSharesSuccess(success)).into());
+                messages.push(upstream_msg.into());
+                let _ = self.vardiff.with_mut(&(downstream_id, channel_id).into(), |vd| {
+                    vd.increment_shares_since_last_update();
+                });
+            }
+            None => {
+                messages.push((downstream_id, build_error("invalid-share")).into());
+            }
+        }
+
+        for message in messages {
+            if let Err(e) = message.forward(&self.channel_manager_io).await {
+                error!("Failed to forward bridge standard share message: {e:?}");
             }
         }
         Ok(())
