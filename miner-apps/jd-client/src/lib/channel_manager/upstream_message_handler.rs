@@ -26,8 +26,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     channel_manager::{
-        downstream_message_handler::RouteMessageTo, BridgeJobRef, ChannelManager, DeclaredJob,
-        WorkSource, JDC_LOCAL_PREFIX_BYTES, JDC_MAX_CHANNELS,
+        downstream_message_handler::RouteMessageTo,
+        tip_bridge::{decide_tip_bridge, TipBridgeDecision},
+        BridgeJobRef, ChannelManager, DeclaredJob, WorkSource, JDC_LOCAL_PREFIX_BYTES,
+        JDC_MAX_CHANNELS,
     },
     error::{self, JDCError, JDCErrorKind},
     utils::{create_close_channel_msg, validate_cached_share, UpstreamState},
@@ -66,30 +68,24 @@ impl ChannelManager {
             .with(|prev| prev.as_ref().map(|p| p.prev_hash.to_array()))
             .map_err(JDCError::shutdown)?;
 
-        // Same tip as local TP → local JD path owns work.
-        if let Some(local) = local_prev {
-            if local == pool_prev {
+        let bridging_prev = self
+            .work_source
+            .with(|ws| match ws {
+                WorkSource::UpstreamBridge { pool_prev_hash, .. } => Some(*pool_prev_hash),
+                WorkSource::Local => None,
+            })
+            .map_err(JDCError::shutdown)?;
+
+        match decide_tip_bridge(true, local_prev, pool_prev, bridging_prev) {
+            TipBridgeDecision::SameTipIgnore => {
                 info!("Pool tip matches local tip — not entering upstream tip bridge");
                 return Ok(());
             }
-        }
-
-        // Already bridging this tip: refresh nothing, keep existing window.
-        let already = self
-            .work_source
-            .with(|ws| {
-                matches!(
-                    ws,
-                    WorkSource::UpstreamBridge {
-                        pool_prev_hash,
-                        ..
-                    } if *pool_prev_hash == pool_prev
-                )
-            })
-            .map_err(JDCError::shutdown)?;
-        if already {
-            debug!("Already bridging this pool tip — ignoring duplicate push");
-            return Ok(());
+            TipBridgeDecision::AlreadyBridgingIgnore => {
+                debug!("Already bridging this pool tip — ignoring duplicate push");
+                return Ok(());
+            }
+            TipBridgeDecision::EnterBridge => {}
         }
 
         // Store job on the client-side upstream channel for share validation / forward.

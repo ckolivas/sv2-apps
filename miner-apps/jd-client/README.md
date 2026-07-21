@@ -118,6 +118,37 @@ If SV1 miners connect to Translator Proxy and Translator Proxy connects to JDC, 
 telemetry on Translator Proxy instead. JDC identifies Translator Proxy as a proxy client, not as the
 ASICs behind it.
 
+### Upstream tip lag bridge
+
+By default, JDC builds work from the **local** template provider (Bitcoin Core IPC or an Sv2 TP)
+and declares custom jobs to the pool. Some pool implementations (for example ckpool SV2 JD) also
+push a short tip update on the **mining** channel (`NewExtendedMiningJob` + `SetNewPrevHash`) when
+the pool tip is ahead of a lagging local node.
+
+JDC can **temporarily** accept that pool tip work so miners do not stay on a stale tip:
+
+```toml
+# Default: true (enabled). Set false to ignore pool tip pushes (legacy behaviour).
+accept_upstream_tip_work = true
+
+# Max seconds to stay on pool tip work before waiting again for local templates.
+upstream_tip_work_timeout_secs = 30
+```
+
+| When | Behaviour |
+|---|---|
+| Pool tip **≠** local tip (or no local tip yet) | Enter bridge: rewrite and fan out pool work to downstreams |
+| Pool tip **==** local tip | Ignore pool work; local JD path owns the tip |
+| Local `NewTemplate` / `SetNewPrevHash` | Exit bridge and switch to local work (soft cutover) |
+| Timeout | Exit bridge and wait for the next local (or pool) tip update |
+
+Shares found on bridged work are validated against the upstream pool job and submitted to the pool
+only (they are not declared via JDS / submitted to the local TP as JDC custom jobs).
+
+**Note:** Tip comparison is currently hash inequality (pool tip differs from the last local
+`SetNewPrevHash`). It does not yet verify the pool tip is a strict child of the local tip via
+`getblockheader`.
+
 Keep pool usernames/worker names unique for connected miners. If two connected miners use the same
 name, telemetry is not assigned to either of them and the monitoring API reports
 `duplicate_worker_name`.

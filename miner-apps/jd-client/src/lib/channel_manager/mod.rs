@@ -75,6 +75,7 @@ pub mod downstream_message_handler;
 mod extensions_message_handler;
 mod jd_message_handler;
 mod template_message_handler;
+pub(crate) mod tip_bridge;
 mod upstream_message_handler;
 
 // ============================================================================
@@ -675,9 +676,11 @@ impl ChannelManager {
         channel_extranonce_prefix: &[u8],
         min_ntime: Option<u32>,
     ) -> Result<NewExtendedMiningJob<'static>, JDCErrorKind> {
-        let mut prefix = pool_job.coinbase_tx_prefix.to_owned_bytes();
-        prefix.extend_from_slice(channel_extranonce_prefix);
-        let prefix: B064K<'static> = prefix
+        let prefix_bytes = tip_bridge::append_channel_prefix_to_coinbase(
+            &pool_job.coinbase_tx_prefix.to_owned_bytes(),
+            channel_extranonce_prefix,
+        );
+        let prefix: B064K<'static> = prefix_bytes
             .try_into()
             .map_err(|_| JDCErrorKind::CustomJobError)?;
         let suffix: B064K<'static> = pool_job
