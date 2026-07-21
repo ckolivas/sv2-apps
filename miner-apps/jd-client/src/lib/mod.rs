@@ -689,11 +689,18 @@ impl JobDeclaratorClient {
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
 
+            // `tried_or_flagged` means this upstream was previously abandoned after a
+            // malicious/declare failure. Still allow reconnect after a clean fallback so a
+            // transient open-channel error does not permanently lock JDC into solo mode.
             if upstream_entry.tried_or_flagged {
                 info!(
-                    "Upstream previously marked as malicious, skipping initial attempt warnings."
+                    "Upstream was previously flagged; clearing flag and retrying pool={}:{}, jds={}:{}",
+                    upstream_entry.pool_host,
+                    upstream_entry.pool_port,
+                    upstream_entry.jds_host,
+                    upstream_entry.jds_port,
                 );
-                continue;
+                upstream_entry.tried_or_flagged = false;
             }
 
             for attempt in 1..=MAX_RETRIES {
@@ -721,7 +728,8 @@ impl JobDeclaratorClient {
                 .await
                 {
                     Ok((upstream, jd)) => {
-                        upstream_entry.tried_or_flagged = true;
+                        // Do not set tried_or_flagged on success — that flag means
+                        // "do not trust / already exhausted", not "connected".
                         return Ok((upstream, jd, upstream_entry.user_identity.clone()));
                     }
                     Err(e) => {
@@ -758,7 +766,8 @@ impl JobDeclaratorClient {
                     }
                 }
             }
-            upstream_entry.tried_or_flagged = true;
+            // Exhausted retries for this upstream only — allow later fallback re-init to try again.
+            upstream_entry.tried_or_flagged = false;
         }
 
         tracing::error!("All upstreams failed after {} retries each", MAX_RETRIES);

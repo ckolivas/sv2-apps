@@ -504,10 +504,23 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
             } else {
                 let next_extended_channel_id =
                     downstream.channel_id_factory.fetch_add(1, Ordering::Relaxed);
+                // Prefer the downstream's min rollable, but if the pool-granted space is
+                // smaller (common when upstream min was capped for pool compatibility),
+                // allocate the maximum available so the channel can still open.
                 let extranonce_prefix = match self
                     .extranonce_allocator
                     .with(|allocator| {
-                        allocator.allocate_extended(requested_min_rollable_extranonce_size.into())
+                        let available = allocator.rollable_extranonce_size() as usize;
+                        let want = requested_min_rollable_extranonce_size as usize;
+                        let request = want.min(available);
+                        if request < want {
+                            warn!(
+                                want,
+                                available,
+                                "Downstream min_extranonce exceeds pool-granted rollable; allocating available size"
+                            );
+                        }
+                        allocator.allocate_extended(request)
                     })
                     .map_err(JDCError::shutdown)?
                 {

@@ -1256,15 +1256,24 @@ impl ChannelManager {
                             //   - the larger of the downstream's request `M` and JDC's retroactive
                             //     commitment to future downstreams
                             //     (`reserved_downstream_rollable_extranonce_size`).
-                            // Equivalently:
-                            //   JDC_LOCAL_PREFIX_BYTES +
-                            //     max(reserved_downstream_rollable, M).
+                            // Cap at 8 so common pools (e.g. ckpool nonce2length ≤ 8) accept the open.
                             let reserved_downstream_rollable =
                                 self.reserved_downstream_rollable_extranonce_size as usize;
                             let downstream_min = upstream_message.min_extranonce_size as usize;
-                            let upstream_min = (JDC_LOCAL_PREFIX_BYTES as usize).saturating_add(
+                            let uncapped = (JDC_LOCAL_PREFIX_BYTES as usize).saturating_add(
                                 std::cmp::max(reserved_downstream_rollable, downstream_min),
                             );
+                            const MAX_COMMON_POOL_EXTRANONCE: usize = 8;
+                            let upstream_min = uncapped.min(MAX_COMMON_POOL_EXTRANONCE);
+                            if uncapped > MAX_COMMON_POOL_EXTRANONCE {
+                                warn!(
+                                    uncapped,
+                                    capped = upstream_min,
+                                    downstream_min,
+                                    reserved_downstream_rollable,
+                                    "Capping upstream min_extranonce_size for pool compatibility"
+                                );
+                            }
                             upstream_message.min_extranonce_size = upstream_min as u16;
                             let upstream_message =
                                 Mining::OpenExtendedMiningChannel(upstream_message).into_static();
@@ -1325,8 +1334,10 @@ impl ChannelManager {
                             // `reserved_downstream_rollable_extranonce_size` so we
                             // still honor our retroactive commitment to any later
                             // extended downstream that attaches to this upstream.
-                            let upstream_min_extranonce_size = (JDC_LOCAL_PREFIX_BYTES as u16)
+                            // Cap at 8 for common pool nonce2length limits (ckpool).
+                            let uncapped = (JDC_LOCAL_PREFIX_BYTES as u16)
                                 + self.reserved_downstream_rollable_extranonce_size as u16;
+                            let upstream_min_extranonce_size = uncapped.min(8);
                             let identity = self.user_identity().to_string();
                             let upstream_open = OpenExtendedMiningChannel {
                                 user_identity: identity.try_into().unwrap(),

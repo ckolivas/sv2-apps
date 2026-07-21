@@ -76,7 +76,12 @@ impl ChannelManager {
             })
             .map_err(JDCError::shutdown)?;
 
-        match decide_tip_bridge(true, local_prev, pool_prev, bridging_prev) {
+        match decide_tip_bridge(
+            self.accept_upstream_tip_work,
+            local_prev,
+            pool_prev,
+            bridging_prev,
+        ) {
             TipBridgeDecision::SameTipIgnore => {
                 info!("Pool tip matches local tip — not entering upstream tip bridge");
                 return Ok(());
@@ -527,9 +532,9 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
 
     // Handles `OpenMiningChannelError` messages received from upstream.
     //
-    // Receiving this message is treated as malicious behavior, since JDC only supports
-    // extended channels. When encountered, we immediately trigger the fallback mechanism
-    // by transitioning the upstream state into a shutdown-fallback mode.
+    // Recoverable size mismatches (e.g. `unsupported-min-extranonce-size`) reset the open
+    // handshake to `NoChannel` without tearing down the whole upstream/JD session. Other
+    // open failures still trigger full fallback.
     async fn handle_open_mining_channel_error(
         &mut self,
         _server_id: Option<usize>,
@@ -537,8 +542,20 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         warn!("Received: {}", msg);
-        warn!("⚠️ Cannot open extended channel with the upstream server, preparing fallback.");
+        let error_code = msg.error_code.as_utf8_or_hex();
 
+        if error_code == "unsupported-min-extranonce-size" {
+            warn!(
+                "Upstream rejected OpenExtendedMiningChannel (unsupported-min-extranonce-size); \
+                 resetting channel open state without full solo fallback"
+            );
+            self.upstream_state.set(UpstreamState::NoChannel);
+            let _ = self.pending_downstream_requests.with(|pending| pending.clear());
+            // Stay connected to pool/JDS so tip-bridge and later open attempts can proceed.
+            return Ok(());
+        }
+
+        warn!("⚠️ Cannot open extended channel with the upstream server, preparing fallback.");
         Err(JDCError::fallback(JDCErrorKind::OpenMiningChannelError))
     }
 
