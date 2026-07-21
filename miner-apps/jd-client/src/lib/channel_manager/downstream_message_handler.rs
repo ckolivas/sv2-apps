@@ -618,68 +618,119 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         .into(),
                 );
 
-                let mut coinbase_outputs =
-                    deserialize_outputs(self.coinbase_outputs.get().map_err(JDCError::shutdown)?)
-                        .map_err(|_| {
-                            JDCError::shutdown(JDCErrorKind::ChannelManagerHasBadCoinbaseOutputs)
+                // While bridging pool tip work, give late joiners the active bridge job
+                // instead of (stale) local tip templates.
+                let bridge_work = self
+                    .active_bridge_work
+                    .with(|w| w.clone())
+                    .map_err(JDCError::shutdown)?;
+                let mut sent_bridge_job = false;
+
+                if self.is_bridging() {
+                    if let Some(bridge) = bridge_work {
+                        let prefix = extended_channel.get_extranonce_prefix().to_vec();
+                        match self.mint_bridge_job_for_channel(
+                            &bridge.pool_job,
+                            &bridge.snph,
+                            bridge.epoch,
+                            bridge.pool_prev,
+                            downstream_id,
+                            extended_channel_id,
+                            &prefix,
+                        ) {
+                            Ok((job, set_prev)) => {
+                                info!(
+                                    downstream_id,
+                                    channel_id = extended_channel_id,
+                                    epoch = bridge.epoch,
+                                    "Late-joining channel receives active upstream tip bridge work"
+                                );
+                                messages.push(
+                                    (downstream_id, Mining::NewExtendedMiningJob(job)).into(),
+                                );
+                                messages.push(
+                                    (downstream_id, Mining::SetNewPrevHash(set_prev)).into(),
+                                );
+                                sent_bridge_job = true;
+                            }
+                            Err(e) => {
+                                error!(
+                                    ?e,
+                                    "Failed to mint bridge job for late-joining channel; using local tip"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Local tip path: used when not bridging, or bridge mint failed.
+                if !sent_bridge_job {
+
+                    let mut coinbase_outputs = deserialize_outputs(
+                        self.coinbase_outputs.get().map_err(JDCError::shutdown)?,
+                    )
+                    .map_err(|_| {
+                        JDCError::shutdown(JDCErrorKind::ChannelManagerHasBadCoinbaseOutputs)
+                    })?;
+                    coinbase_outputs[0].value =
+                        Amount::from_sat(last_future_template.coinbase_tx_value_remaining);
+                    extended_channel
+                        .on_new_template(last_future_template.clone(), coinbase_outputs)
+                        .map_err(|e| {
+                            error!(?e, "Failed to apply template to extended channel");
+                            JDCError::shutdown(e)
                         })?;
-                coinbase_outputs[0].value =
-                    Amount::from_sat(last_future_template.coinbase_tx_value_remaining);
-                extended_channel
-                    .on_new_template(last_future_template.clone(), coinbase_outputs)
-                    .map_err(|e| {
-                        error!(?e, "Failed to apply template to extended channel");
-                        JDCError::shutdown(e)
-                    })?;
 
-                let future_extended_job_id = extended_channel
-                    .get_future_job_id_from_template_id(last_future_template.template_id)
-                    .expect("future job id must exist");
-                let future_extended_job_message = extended_channel
-                    .get_future_job(future_extended_job_id)
-                    .expect("future job must exist")
-                    .get_job_message()
-                    .clone()
-                    .into_static();
-                messages.push(
-                    (
-                        downstream_id,
-                        Mining::NewExtendedMiningJob(future_extended_job_message),
-                    )
-                        .into(),
-                );
+                    let future_extended_job_id = extended_channel
+                        .get_future_job_id_from_template_id(last_future_template.template_id)
+                        .expect("future job id must exist");
+                    let future_extended_job_message = extended_channel
+                        .get_future_job(future_extended_job_id)
+                        .expect("future job must exist")
+                        .get_job_message()
+                        .clone()
+                        .into_static();
+                    messages.push(
+                        (
+                            downstream_id,
+                            Mining::NewExtendedMiningJob(future_extended_job_message),
+                        )
+                            .into(),
+                    );
 
-                let prev_hash = last_new_prev_hash.prev_hash.clone();
-                let header_timestamp = last_new_prev_hash.header_timestamp;
-                let n_bits = last_new_prev_hash.n_bits;
-                let set_new_prev_hash_mining = SetNewPrevHash {
-                    channel_id: extended_channel_id,
-                    job_id: future_extended_job_id,
-                    prev_hash,
-                    min_ntime: header_timestamp,
-                    nbits: n_bits,
-                };
-                extended_channel
-                    .on_set_new_prev_hash(last_new_prev_hash)
-                    .map_err(|e| {
-                        error!(?e, "Failed to set prevhash on extended channel");
-                        JDCError::shutdown(e)
-                    })?;
-                messages.push(
-                    (
-                        downstream_id,
-                        Mining::SetNewPrevHash(set_new_prev_hash_mining),
-                    )
-                        .into(),
-                );
+                    let prev_hash = last_new_prev_hash.prev_hash.clone();
+                    let header_timestamp = last_new_prev_hash.header_timestamp;
+                    let n_bits = last_new_prev_hash.n_bits;
+                    let set_new_prev_hash_mining = SetNewPrevHash {
+                        channel_id: extended_channel_id,
+                        job_id: future_extended_job_id,
+                        prev_hash,
+                        min_ntime: header_timestamp,
+                        nbits: n_bits,
+                    };
+                    extended_channel
+                        .on_set_new_prev_hash(last_new_prev_hash)
+                        .map_err(|e| {
+                            error!(?e, "Failed to set prevhash on extended channel");
+                            JDCError::shutdown(e)
+                        })?;
+                    messages.push(
+                        (
+                            downstream_id,
+                            Mining::SetNewPrevHash(set_new_prev_hash_mining),
+                        )
+                            .into(),
+                    );
+
+                    self.downstream_channel_id_and_job_id_to_template_id.insert(
+                        (downstream_id, extended_channel_id, future_extended_job_id).into(),
+                        last_future_template.template_id,
+                    );
+                }
 
                 downstream
                     .extended_channels
                     .insert(extended_channel_id, extended_channel);
-                self.downstream_channel_id_and_job_id_to_template_id.insert(
-                    (downstream_id, extended_channel_id, future_extended_job_id).into(),
-                    last_future_template.template_id,
-                );
                 self.vardiff.insert(
                     (downstream_id, extended_channel_id).into(),
                     VardiffState::new().expect("Vardiff should instantiate."),

@@ -139,6 +139,7 @@ upstream_tip_work_timeout_secs = 30
 |---|---|
 | Pool tip **≠** local tip (or no local tip yet) | Enter bridge: rewrite and fan out pool work to downstreams |
 | Pool tip **==** local tip | Ignore pool work; local JD path owns the tip |
+| New downstream channel while bridging | Late joiners receive the active bridge job (not stale local tip) |
 | Local `NewTemplate` / `SetNewPrevHash` | Exit bridge and switch to local work (soft cutover) |
 | Timeout | Exit bridge and wait for the next local (or pool) tip update |
 

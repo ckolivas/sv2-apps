@@ -38,8 +38,8 @@ use stratum_apps::{
         },
         binary_sv2::{Sv2Option, B064K},
         mining_sv2::{
-            NewExtendedMiningJob, OpenExtendedMiningChannel, SetCustomMiningJob, SetTarget,
-            UpdateChannel,
+            NewExtendedMiningJob, OpenExtendedMiningChannel, SetCustomMiningJob, SetNewPrevHash,
+            SetTarget, UpdateChannel,
         },
         parsers_sv2::{AnyMessage, JobDeclaration, Mining, TemplateDistribution, Tlv},
         template_distribution_sv2::{NewTemplate, SetNewPrevHash as SetNewPrevHashTdp},
@@ -150,6 +150,15 @@ pub struct BridgeJobRef {
     pub pool_min_ntime: u32,
     /// Epoch of the bridge session that minted this job.
     pub epoch: u64,
+}
+
+/// Pool tip work currently being bridged (kept so late-joining channels can receive it).
+#[derive(Debug, Clone)]
+pub struct ActiveBridgeWork {
+    pub epoch: u64,
+    pub pool_prev: [u8; 32],
+    pub pool_job: NewExtendedMiningJob<'static>,
+    pub snph: SetNewPrevHash<'static>,
 }
 
 /// A `DeclaredJob` encapsulates all the relevant data associated with a single
@@ -362,6 +371,8 @@ pub struct ChannelManager {
     pub work_source: SharedLock<WorkSource>,
     /// Buffered upstream `NewExtendedMiningJob` waiting for matching `SetNewPrevHash`.
     pub pending_upstream_job: SharedLock<Option<NewExtendedMiningJob<'static>>>,
+    /// Active pool tip work while bridging (for late-joining downstream channels).
+    pub active_bridge_work: SharedLock<Option<ActiveBridgeWork>>,
     /// Downstream job ids minted while bridging → pool job reference.
     pub bridge_job_map: SharedMap<DownstreamChannelJobId, BridgeJobRef>,
     /// Local job id allocator for bridge jobs.
@@ -414,6 +425,9 @@ impl ChannelManager {
             .map_err(JDCError::shutdown)?;
         self.pending_upstream_job
             .with(|job| *job = None)
+            .map_err(JDCError::shutdown)?;
+        self.active_bridge_work
+            .with(|work| *work = None)
             .map_err(JDCError::shutdown)?;
         self.negotiated_extensions
             .with(|extensions| extensions.clear())
@@ -566,6 +580,7 @@ impl ChannelManager {
             upstream_tip_work_timeout: Duration::from_secs(config.upstream_tip_work_timeout_secs()),
             work_source: SharedLock::new(WorkSource::Local),
             pending_upstream_job: SharedLock::new(None),
+            active_bridge_work: SharedLock::new(None),
             bridge_job_map: SharedMap::new(),
             bridge_job_id_factory: Arc::new(AtomicU32::new(1)),
             bridge_epoch_factory: Arc::new(AtomicU32::new(1)),
@@ -638,6 +653,7 @@ impl ChannelManager {
         if left {
             self.bridge_job_map.retain(|_, r| r.epoch != epoch);
             let _ = self.pending_upstream_job.with(|j| *j = None);
+            let _ = self.active_bridge_work.with(|w| *w = None);
             info!(epoch, "{reason}");
         }
     }
@@ -661,8 +677,51 @@ impl ChannelManager {
         if let Some(epoch) = epoch {
             self.bridge_job_map.retain(|_, r| r.epoch != epoch);
             let _ = self.pending_upstream_job.with(|j| *j = None);
+            let _ = self.active_bridge_work.with(|w| *w = None);
             info!(epoch, "{reason}");
         }
+    }
+
+    /// Build downstream mining messages for one channel from active (or provided) bridge work.
+    ///
+    /// Returns `(NewExtendedMiningJob, SetNewPrevHash)` ready to send, and registers the
+    /// local job id in [`Self::bridge_job_map`].
+    pub(crate) fn mint_bridge_job_for_channel(
+        &self,
+        pool_job: &NewExtendedMiningJob<'static>,
+        snph: &SetNewPrevHash<'static>,
+        epoch: u64,
+        pool_prev: [u8; 32],
+        downstream_id: DownstreamId,
+        channel_id: ChannelId,
+        channel_extranonce_prefix: &[u8],
+    ) -> Result<(NewExtendedMiningJob<'static>, SetNewPrevHash<'static>), JDCErrorKind> {
+        let local_job_id = self.bridge_job_id_factory.fetch_add(1, Ordering::Relaxed);
+        let job = Self::rewrite_pool_job_for_downstream(
+            pool_job,
+            channel_id,
+            local_job_id,
+            channel_extranonce_prefix,
+            Some(snph.min_ntime),
+        )?;
+        self.bridge_job_map.insert(
+            (downstream_id, channel_id, local_job_id).into(),
+            BridgeJobRef {
+                pool_job_id: pool_job.job_id,
+                pool_prev_hash: pool_prev,
+                pool_nbits: snph.nbits,
+                pool_min_ntime: snph.min_ntime,
+                epoch,
+            },
+        );
+        let set_prev = SetNewPrevHash {
+            channel_id,
+            job_id: local_job_id,
+            prev_hash: snph.prev_hash.clone().into_static(),
+            min_ntime: snph.min_ntime,
+            nbits: snph.nbits,
+        };
+        Ok((job, set_prev))
     }
 
     /// Rewrite a pool `NewExtendedMiningJob` so a downstream channel rolls only its own slice.

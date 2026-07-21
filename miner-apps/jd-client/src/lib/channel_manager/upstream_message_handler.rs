@@ -28,8 +28,7 @@ use crate::{
     channel_manager::{
         downstream_message_handler::RouteMessageTo,
         tip_bridge::{decide_tip_bridge, TipBridgeDecision},
-        BridgeJobRef, ChannelManager, DeclaredJob, WorkSource, JDC_LOCAL_PREFIX_BYTES,
-        JDC_MAX_CHANNELS,
+        ChannelManager, DeclaredJob, WorkSource, JDC_LOCAL_PREFIX_BYTES, JDC_MAX_CHANNELS,
     },
     error::{self, JDCError, JDCErrorKind},
     utils::{create_close_channel_msg, validate_cached_share, UpstreamState},
@@ -148,6 +147,17 @@ impl ChannelManager {
         // Drop jobs from any previous bridge session.
         self.bridge_job_map.retain(|_, r| r.epoch == epoch);
 
+        self.active_bridge_work
+            .with(|work| {
+                *work = Some(crate::channel_manager::ActiveBridgeWork {
+                    epoch,
+                    pool_prev,
+                    pool_job: pool_job.clone(),
+                    snph: snph.clone(),
+                });
+            })
+            .map_err(JDCError::shutdown)?;
+
         info!(
             epoch,
             pool_job_id,
@@ -169,9 +179,6 @@ impl ChannelManager {
     ) -> Result<(), JDCError<error::ChannelManager>> {
         let mut messages: Vec<RouteMessageTo> = Vec::new();
         let pool_job_id = pool_job.job_id;
-        let pool_nbits = snph.nbits;
-        let pool_min_ntime = snph.min_ntime;
-        let prev_hash = snph.prev_hash.clone().into_static();
 
         // Collect (downstream_id, channel_id, prefix) first so we do not re-enter maps.
         let mut targets: Vec<(usize, u32, Vec<u8>)> = Vec::new();
@@ -186,46 +193,23 @@ impl ChannelManager {
         });
 
         for (downstream_id, channel_id, prefix) in targets {
-            let local_job_id = self.bridge_job_id_factory.fetch_add(1, Ordering::Relaxed);
-            let job = match ChannelManager::rewrite_pool_job_for_downstream(
+            match self.mint_bridge_job_for_channel(
                 pool_job,
+                snph,
+                epoch,
+                pool_prev,
+                downstream_id,
                 channel_id,
-                local_job_id,
                 &prefix,
-                Some(pool_min_ntime),
             ) {
-                Ok(j) => j,
-                Err(e) => {
-                    error!(?e, channel_id, "Failed to rewrite pool job for downstream");
-                    continue;
+                Ok((job, set_prev)) => {
+                    messages.push((downstream_id, Mining::NewExtendedMiningJob(job)).into());
+                    messages.push((downstream_id, Mining::SetNewPrevHash(set_prev)).into());
                 }
-            };
-
-            self.bridge_job_map.insert(
-                (downstream_id, channel_id, local_job_id).into(),
-                BridgeJobRef {
-                    pool_job_id,
-                    pool_prev_hash: pool_prev,
-                    pool_nbits,
-                    pool_min_ntime,
-                    epoch,
-                },
-            );
-
-            messages.push((downstream_id, Mining::NewExtendedMiningJob(job)).into());
-            messages.push(
-                (
-                    downstream_id,
-                    Mining::SetNewPrevHash(SetNewPrevHash {
-                        channel_id,
-                        job_id: local_job_id,
-                        prev_hash: prev_hash.clone(),
-                        min_ntime: pool_min_ntime,
-                        nbits: pool_nbits,
-                    }),
-                )
-                    .into(),
-            );
+                Err(e) => {
+                    error!(?e, channel_id, "Failed to mint bridge job for downstream");
+                }
+            }
         }
 
         for message in messages {
