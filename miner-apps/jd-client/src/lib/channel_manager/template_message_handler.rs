@@ -466,6 +466,9 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
             );
         }
 
+        // Track tip history so a lagging pool tip is not mistaken for "pool ahead".
+        self.record_local_tip(msg.prev_hash.to_array());
+
         let outputs = deserialize_outputs(self.coinbase_outputs.get().map_err(JDCError::shutdown)?)
             .map_err(|_| JDCError::shutdown(JDCErrorKind::ChannelManagerHasBadCoinbaseOutputs))?;
 

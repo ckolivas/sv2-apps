@@ -146,9 +146,11 @@ upstream_tip_work_timeout_secs = 30
 Shares found on bridged work are validated against the upstream pool job and submitted to the pool
 only (they are not declared via JDS / submitted to the local TP as JDC custom jobs).
 
-**Note:** Tip comparison is currently hash inequality (pool tip differs from the last local
-`SetNewPrevHash`). It does not yet verify the pool tip is a strict child of the local tip via
-`getblockheader`.
+**Note:** Tip comparison uses local tip history (not full `getblockheader` parent proofs):
+
+- pool tip == current local tip → ignore  
+- pool tip matches an *older* local tip → treat as pool-behind, ignore  
+- otherwise → enter bridge (likely pool-ahead)
 
 Keep pool usernames/worker names unique for connected miners. If two connected miners use the same
 name, telemetry is not assigned to either of them and the monitoring API reports

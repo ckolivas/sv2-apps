@@ -116,6 +116,9 @@ const JDC_LOCAL_PREFIX_BYTES: u8 = bytes_needed(JDC_MAX_CHANNELS);
 /// ```
 pub const SOLO_FULL_EXTRANONCE_SIZE: u8 = 20;
 
+/// How many prior local tips to retain for pool-behind detection.
+pub const RECENT_LOCAL_TIP_HISTORY: usize = 16;
+
 /// Where JDC is currently sourcing work for downstreams.
 #[derive(Debug, Clone)]
 pub enum WorkSource {
@@ -373,6 +376,8 @@ pub struct ChannelManager {
     pub pending_upstream_job: SharedLock<Option<NewExtendedMiningJob<'static>>>,
     /// Active pool tip work while bridging (for late-joining downstream channels).
     pub active_bridge_work: SharedLock<Option<ActiveBridgeWork>>,
+    /// Recent local TP tips (oldest → newest), used to distinguish pool-ahead vs pool-behind.
+    pub recent_local_tips: SharedLock<Vec<[u8; 32]>>,
     /// Downstream job ids minted while bridging → pool job reference.
     pub bridge_job_map: SharedMap<DownstreamChannelJobId, BridgeJobRef>,
     /// Local job id allocator for bridge jobs.
@@ -429,6 +434,9 @@ impl ChannelManager {
         self.active_bridge_work
             .with(|work| *work = None)
             .map_err(JDCError::shutdown)?;
+        self.recent_local_tips
+            .with(|tips| tips.clear())
+            .map_err(JDCError::shutdown)?;
         self.negotiated_extensions
             .with(|extensions| extensions.clear())
             .map_err(JDCError::shutdown)?;
@@ -449,6 +457,13 @@ impl ChannelManager {
             .with(|inner| *inner = allocator)
             .map_err(JDCError::shutdown)?;
         Ok(())
+    }
+
+    /// Record a local TP tip hash for pool-behind detection.
+    pub(crate) fn record_local_tip(&self, tip: [u8; 32]) {
+        let _ = self.recent_local_tips.with(|tips| {
+            tip_bridge::push_local_tip(tips, tip, RECENT_LOCAL_TIP_HISTORY);
+        });
     }
 
     fn handle_error_action(
@@ -581,6 +596,7 @@ impl ChannelManager {
             work_source: SharedLock::new(WorkSource::Local),
             pending_upstream_job: SharedLock::new(None),
             active_bridge_work: SharedLock::new(None),
+            recent_local_tips: SharedLock::new(Vec::new()),
             bridge_job_map: SharedMap::new(),
             bridge_job_id_factory: Arc::new(AtomicU32::new(1)),
             bridge_epoch_factory: Arc::new(AtomicU32::new(1)),

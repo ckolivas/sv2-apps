@@ -62,9 +62,9 @@ impl ChannelManager {
 
         let pool_prev: [u8; 32] = snph.prev_hash.to_array();
 
-        let local_prev = self
-            .last_new_prev_hash
-            .with(|prev| prev.as_ref().map(|p| p.prev_hash.to_array()))
+        let recent_tips = self
+            .recent_local_tips
+            .with(|tips| tips.clone())
             .map_err(JDCError::shutdown)?;
 
         let bridging_prev = self
@@ -77,12 +77,18 @@ impl ChannelManager {
 
         match decide_tip_bridge(
             self.accept_upstream_tip_work,
-            local_prev,
+            &recent_tips,
             pool_prev,
             bridging_prev,
         ) {
             TipBridgeDecision::SameTipIgnore => {
                 info!("Pool tip matches local tip — not entering upstream tip bridge");
+                return Ok(());
+            }
+            TipBridgeDecision::PoolBehindIgnore => {
+                info!(
+                    "Pool tip matches an older local tip — pool is behind; ignoring tip bridge"
+                );
                 return Ok(());
             }
             TipBridgeDecision::AlreadyBridgingIgnore => {
