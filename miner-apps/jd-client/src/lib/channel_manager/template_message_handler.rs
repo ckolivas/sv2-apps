@@ -37,6 +37,14 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
+        self.maybe_expire_bridge();
+
+        // Local work takes priority over a temporary pool tip bridge (soft cutover).
+        if self.is_bridging() {
+            self.exit_bridge_any(
+                "local NewTemplate received — exiting upstream tip bridge (clean=false cutover)",
+            );
+        }
 
         self.template_store
             .insert(msg.template_id, msg.clone().into_static());
@@ -449,6 +457,14 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
+        self.maybe_expire_bridge();
+
+        // Local tip update ends bridge mode; remaining path builds local jobs for downstreams.
+        if self.is_bridging() {
+            self.exit_bridge_any(
+                "local SetNewPrevHash received — exiting upstream tip bridge (clean=false cutover)",
+            );
+        }
 
         let outputs = deserialize_outputs(self.coinbase_outputs.get().map_err(JDCError::shutdown)?)
             .map_err(|_| JDCError::shutdown(JDCErrorKind::ChannelManagerHasBadCoinbaseOutputs))?;

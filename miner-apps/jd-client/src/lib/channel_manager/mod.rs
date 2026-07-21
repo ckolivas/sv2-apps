@@ -7,6 +7,7 @@ use std::{
         atomic::{AtomicU32, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
+    time::{Duration, Instant},
 };
 
 use async_channel::{unbounded, Receiver, Sender};
@@ -35,7 +36,11 @@ use stratum_apps::{
         job_declaration_sv2::{
             AllocateMiningJobToken, AllocateMiningJobTokenSuccess, DeclareMiningJob,
         },
-        mining_sv2::{OpenExtendedMiningChannel, SetCustomMiningJob, SetTarget, UpdateChannel},
+        binary_sv2::{Sv2Option, B064K},
+        mining_sv2::{
+            NewExtendedMiningJob, OpenExtendedMiningChannel, SetCustomMiningJob, SetTarget,
+            UpdateChannel,
+        },
         parsers_sv2::{AnyMessage, JobDeclaration, Mining, TemplateDistribution, Tlv},
         template_distribution_sv2::{NewTemplate, SetNewPrevHash as SetNewPrevHashTdp},
     },
@@ -44,7 +49,7 @@ use stratum_apps::{
     utils::{
         protocol_message_type::{protocol_message_type, MessageType},
         types::{
-            ChannelId, DownstreamId, RequestId, SharesBatchSize, SharesPerMinute, Sv2Frame,
+            ChannelId, DownstreamId, JobId, RequestId, SharesBatchSize, SharesPerMinute, Sv2Frame,
             TemplateId, UpstreamJobId, VardiffKey,
         },
     },
@@ -63,6 +68,7 @@ use crate::{
         SharesOrderedByDiff, UpstreamState,
     },
 };
+
 #[cfg(feature = "monitoring")]
 use stratum_apps::monitoring::{MinerTelemetry, MinerTelemetryStatus};
 pub mod downstream_message_handler;
@@ -108,6 +114,42 @@ const JDC_LOCAL_PREFIX_BYTES: u8 = bytes_needed(JDC_MAX_CHANNELS);
 /// |<----- SOLO_FULL_EXTRANONCE_SIZE = 20 ---------->|
 /// ```
 pub const SOLO_FULL_EXTRANONCE_SIZE: u8 = 20;
+
+/// Where JDC is currently sourcing work for downstreams.
+#[derive(Debug, Clone)]
+pub enum WorkSource {
+    /// Normal path: templates from the local TP / bitcoind.
+    Local,
+    /// Temporarily mining pool-provided tip work while local tip lags.
+    UpstreamBridge {
+        /// Monotonic epoch so timeout tasks can ignore stale deadlines.
+        epoch: u64,
+        #[allow(dead_code)]
+        accepted_at: Instant,
+        deadline: Instant,
+        pool_prev_hash: [u8; 32],
+        #[allow(dead_code)]
+        pool_job_id: UpstreamJobId,
+        #[allow(dead_code)]
+        pool_nbits: u32,
+        #[allow(dead_code)]
+        pool_min_ntime: u32,
+    },
+}
+
+/// Mapping from a downstream-local job id (minted while bridging) to the pool job.
+#[derive(Debug, Clone)]
+pub struct BridgeJobRef {
+    pub pool_job_id: UpstreamJobId,
+    #[allow(dead_code)]
+    pub pool_prev_hash: [u8; 32],
+    #[allow(dead_code)]
+    pub pool_nbits: u32,
+    #[allow(dead_code)]
+    pub pool_min_ntime: u32,
+    /// Epoch of the bridge session that minted this job.
+    pub epoch: u64,
+}
 
 /// A `DeclaredJob` encapsulates all the relevant data associated with a single
 /// job declaration, including its template, optional messages, coinbase output,
@@ -311,6 +353,20 @@ pub struct ChannelManager {
     /// 4. SoloMining: No upstream is available; the JDC operates in solo mining mode. case.
     pub upstream_state: AtomicUpstreamState,
     pub mode: JDMode,
+    /// Opt-in: mine pool tip work when the pool appears ahead of local TP.
+    pub accept_upstream_tip_work: bool,
+    /// Max duration of an upstream tip bridge session.
+    pub upstream_tip_work_timeout: Duration,
+    /// Current work source (local templates vs temporary pool tip bridge).
+    pub work_source: SharedLock<WorkSource>,
+    /// Buffered upstream `NewExtendedMiningJob` waiting for matching `SetNewPrevHash`.
+    pub pending_upstream_job: SharedLock<Option<NewExtendedMiningJob<'static>>>,
+    /// Downstream job ids minted while bridging → pool job reference.
+    pub bridge_job_map: SharedMap<DownstreamChannelJobId, BridgeJobRef>,
+    /// Local job id allocator for bridge jobs.
+    pub bridge_job_id_factory: Arc<AtomicU32>,
+    /// Increments each time a new bridge session starts (timeout safety).
+    pub bridge_epoch_factory: Arc<AtomicU32>,
     #[cfg(feature = "monitoring")]
     pub(crate) miner_telemetry: MinerTelemetryState,
 }
@@ -329,6 +385,7 @@ impl ChannelManager {
         self.last_declare_job_store.clear();
         self.template_id_to_upstream_job_id.clear();
         self.downstream_channel_id_and_job_id_to_template_id.clear();
+        self.bridge_job_map.clear();
         self.pending_downstream_requests
             .with(|pending| pending.clear())
             .map_err(JDCError::shutdown)?;
@@ -351,6 +408,12 @@ impl ChannelManager {
         self.last_new_prev_hash
             .with(|prev_hash| *prev_hash = None)
             .map_err(JDCError::shutdown)?;
+        self.work_source
+            .with(|ws| *ws = WorkSource::Local)
+            .map_err(JDCError::shutdown)?;
+        self.pending_upstream_job
+            .with(|job| *job = None)
+            .map_err(JDCError::shutdown)?;
         self.negotiated_extensions
             .with(|extensions| extensions.clear())
             .map_err(JDCError::shutdown)?;
@@ -360,6 +423,8 @@ impl ChannelManager {
         self.request_id_factory.store(0, Ordering::Relaxed);
         self.downstream_id_factory.store(0, Ordering::Relaxed);
         self.sequence_number_factory.store(1, Ordering::Relaxed);
+        self.bridge_job_id_factory.store(1, Ordering::Relaxed);
+        self.bridge_epoch_factory.store(1, Ordering::Relaxed);
         self.vardiff.clear();
 
         let allocator =
@@ -496,6 +561,13 @@ impl ChannelManager {
                 .reserved_downstream_rollable_extranonce_size(),
             upstream_state: AtomicUpstreamState::new(UpstreamState::SoloMining),
             mode,
+            accept_upstream_tip_work: config.accept_upstream_tip_work(),
+            upstream_tip_work_timeout: Duration::from_secs(config.upstream_tip_work_timeout_secs()),
+            work_source: SharedLock::new(WorkSource::Local),
+            pending_upstream_job: SharedLock::new(None),
+            bridge_job_map: SharedMap::new(),
+            bridge_job_id_factory: Arc::new(AtomicU32::new(1)),
+            bridge_epoch_factory: Arc::new(AtomicU32::new(1)),
             #[cfg(feature = "monitoring")]
             miner_telemetry: MinerTelemetryState::new(
                 config.miner_telemetry_cidrs().to_vec(),
@@ -514,6 +586,116 @@ impl ChannelManager {
 
     fn user_identity(&self) -> &str {
         self.user_identity.get().expect("identity should be set")
+    }
+
+    /// True when we are currently bridging pool tip work to downstreams.
+    pub(crate) fn is_bridging(&self) -> bool {
+        self.work_source
+            .with(|ws| matches!(ws, WorkSource::UpstreamBridge { .. }))
+            .unwrap_or(false)
+    }
+
+    /// Expire an active bridge session if its deadline has passed.
+    pub(crate) fn maybe_expire_bridge(&self) {
+        let expired = self
+            .work_source
+            .with(|ws| match ws {
+                WorkSource::UpstreamBridge {
+                    epoch, deadline, ..
+                } if Instant::now() >= *deadline => Some(*epoch),
+                _ => None,
+            })
+            .ok()
+            .flatten();
+        if let Some(epoch) = expired {
+            self.exit_bridge(
+                epoch,
+                "upstream tip bridge timed out; waiting for local templates",
+            );
+        }
+    }
+
+    /// Leave bridge mode if `epoch` still matches the active session.
+    pub(crate) fn exit_bridge(&self, epoch: u64, reason: &str) {
+        let left = self
+            .work_source
+            .with(|ws| {
+                if let WorkSource::UpstreamBridge {
+                    epoch: active_epoch,
+                    ..
+                } = ws
+                {
+                    if *active_epoch == epoch {
+                        *ws = WorkSource::Local;
+                        return true;
+                    }
+                }
+                false
+            })
+            .unwrap_or(false);
+
+        if left {
+            self.bridge_job_map.retain(|_, r| r.epoch != epoch);
+            let _ = self.pending_upstream_job.with(|j| *j = None);
+            info!(epoch, "{reason}");
+        }
+    }
+
+    /// Exit bridge mode regardless of epoch (e.g. local work arrived).
+    pub(crate) fn exit_bridge_any(&self, reason: &str) {
+        let epoch = self
+            .work_source
+            .with(|ws| {
+                if let WorkSource::UpstreamBridge { epoch, .. } = ws {
+                    let e = *epoch;
+                    *ws = WorkSource::Local;
+                    Some(e)
+                } else {
+                    None
+                }
+            })
+            .ok()
+            .flatten();
+
+        if let Some(epoch) = epoch {
+            self.bridge_job_map.retain(|_, r| r.epoch != epoch);
+            let _ = self.pending_upstream_job.with(|j| *j = None);
+            info!(epoch, "{reason}");
+        }
+    }
+
+    /// Rewrite a pool `NewExtendedMiningJob` so a downstream channel rolls only its own slice.
+    ///
+    /// Pool job coinbase encloses the full upstream extranonce (`upstream_prefix || channel_prefix_tail`).
+    /// Downstream miners see `pool_prefix || channel_extranonce_prefix` as fixed prefix and roll the rest.
+    pub(crate) fn rewrite_pool_job_for_downstream(
+        pool_job: &NewExtendedMiningJob<'static>,
+        channel_id: ChannelId,
+        local_job_id: JobId,
+        channel_extranonce_prefix: &[u8],
+        min_ntime: Option<u32>,
+    ) -> Result<NewExtendedMiningJob<'static>, JDCErrorKind> {
+        let mut prefix = pool_job.coinbase_tx_prefix.to_owned_bytes();
+        prefix.extend_from_slice(channel_extranonce_prefix);
+        let prefix: B064K<'static> = prefix
+            .try_into()
+            .map_err(|_| JDCErrorKind::CustomJobError)?;
+        let suffix: B064K<'static> = pool_job
+            .coinbase_tx_suffix
+            .to_owned_bytes()
+            .try_into()
+            .map_err(|_| JDCErrorKind::CustomJobError)?;
+
+        Ok(NewExtendedMiningJob {
+            channel_id,
+            job_id: local_job_id,
+            min_ntime: Sv2Option::new(min_ntime),
+            version: pool_job.version,
+            version_rolling_allowed: pool_job.version_rolling_allowed,
+            merkle_path: pool_job.merkle_path.clone().into_static(),
+            coinbase_tx_prefix: prefix,
+            coinbase_tx_suffix: suffix,
+        })
     }
 
     // Bootstraps a group channel with the given parameters.
@@ -804,6 +986,8 @@ impl ChannelManager {
             let vd = self.clone();
             let vardiff_future = vd.run_vardiff_loop();
             tokio::pin!(vardiff_future);
+            let mut bridge_tick =
+                tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
                 let mut cm_jds = cm.clone();
                 let mut cm_pool = cm.clone();
@@ -824,6 +1008,9 @@ impl ChannelManager {
                         }
 
                         break;
+                    }
+                    _ = bridge_tick.tick() => {
+                        cm.maybe_expire_bridge();
                     }
                     res = &mut vardiff_future => {
                         info!("Vardiff loop completed with: {res:?}");

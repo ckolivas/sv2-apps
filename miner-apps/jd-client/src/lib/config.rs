@@ -65,6 +65,14 @@ pub struct JobDeclaratorClientConfig {
     /// downstreams may request more.
     #[serde(default = "default_reserved_downstream_rollable_extranonce_size")]
     reserved_downstream_rollable_extranonce_size: u8,
+    /// When true, briefly mine pool-provided tip work if the pool tip appears ahead of the local
+    /// template provider (e.g. bitcoind lagging a pool tip push). Defaults to enabled.
+    #[serde(default = "default_accept_upstream_tip_work")]
+    accept_upstream_tip_work: bool,
+    /// Max seconds to stay on pool tip work before reverting to waiting for local templates.
+    /// Only used when [`Self::accept_upstream_tip_work`] is true. Defaults to 30.
+    #[serde(default = "default_upstream_tip_work_timeout_secs")]
+    upstream_tip_work_timeout_secs: u64,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -81,6 +89,17 @@ pub const DEFAULT_RESERVED_DOWNSTREAM_ROLLABLE_EXTRANONCE_SIZE: u8 = 8;
 
 fn default_reserved_downstream_rollable_extranonce_size() -> u8 {
     DEFAULT_RESERVED_DOWNSTREAM_ROLLABLE_EXTRANONCE_SIZE
+}
+
+/// Default bridge window for [`JobDeclaratorClientConfig::upstream_tip_work_timeout_secs`].
+pub const DEFAULT_UPSTREAM_TIP_WORK_TIMEOUT_SECS: u64 = 30;
+
+fn default_upstream_tip_work_timeout_secs() -> u64 {
+    DEFAULT_UPSTREAM_TIP_WORK_TIMEOUT_SECS
+}
+
+fn default_accept_upstream_tip_work() -> bool {
+    true
 }
 
 impl JobDeclaratorClientConfig {
@@ -125,6 +144,8 @@ impl JobDeclaratorClientConfig {
             reserved_downstream_rollable_extranonce_size:
                 reserved_downstream_rollable_extranonce_size
                     .unwrap_or(DEFAULT_RESERVED_DOWNSTREAM_ROLLABLE_EXTRANONCE_SIZE),
+            accept_upstream_tip_work: true,
+            upstream_tip_work_timeout_secs: DEFAULT_UPSTREAM_TIP_WORK_TIMEOUT_SECS,
         }
     }
 
@@ -228,6 +249,16 @@ impl JobDeclaratorClientConfig {
     /// field).
     pub fn reserved_downstream_rollable_extranonce_size(&self) -> u8 {
         self.reserved_downstream_rollable_extranonce_size
+    }
+
+    /// Whether to briefly mine pool tip work when the pool appears ahead of local bitcoind.
+    pub fn accept_upstream_tip_work(&self) -> bool {
+        self.accept_upstream_tip_work
+    }
+
+    /// Timeout for pool-tip bridge work in seconds.
+    pub fn upstream_tip_work_timeout_secs(&self) -> u64 {
+        self.upstream_tip_work_timeout_secs
     }
 }
 

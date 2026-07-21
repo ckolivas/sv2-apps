@@ -30,11 +30,13 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     channel_manager::{
-        ChannelManager, ChannelManagerIo, SharesOrderedByDiff, SOLO_FULL_EXTRANONCE_SIZE,
+        BridgeJobRef, ChannelManager, ChannelManagerIo, SharesOrderedByDiff,
+        SOLO_FULL_EXTRANONCE_SIZE,
     },
     error::{self, JDCError, JDCErrorKind},
     utils::{add_share_to_cache, create_close_channel_msg},
 };
+use stratum_apps::utils::types::DownstreamId;
 
 /// `RouteMessageTo` is an abstraction used to route protocol messages
 /// to the appropriate subsystem connected to the JDC.
@@ -1157,6 +1159,15 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         let downstream_job_id = msg.job_id;
         let downstream_id =
             client_id.expect("client_id must be present for downstream_id extraction");
+
+        // Bridge jobs are not in the server job store — route before local validate_share.
+        let bridge_key = (downstream_id, channel_id, downstream_job_id).into();
+        if let Some(bridge_ref) = self.bridge_job_map.get_cloned(&bridge_key) {
+            return self
+                .handle_bridge_submit_shares_extended(downstream_id, msg, bridge_ref)
+                .await;
+        }
+
         let negotiated_extensions = self.get_negotiated_extensions_with_client(client_id);
 
         let build_error = |code: &str| {
@@ -1441,5 +1452,143 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
             0,
             MESSAGE_TYPE_SET_CUSTOM_MINING_JOB,
         )))
+    }
+}
+
+#[cfg_attr(not(test), hotpath::measure_all)]
+impl ChannelManager {
+    /// Validate and forward a share that was found on pool tip-bridge work.
+    ///
+    /// Bridge jobs are not registered in the server job store, so validation is performed
+    /// against the client-side upstream channel (which holds the original pool job).
+    async fn handle_bridge_submit_shares_extended(
+        &mut self,
+        downstream_id: DownstreamId,
+        msg: SubmitSharesExtended<'_>,
+        bridge_ref: BridgeJobRef,
+    ) -> Result<(), JDCError<error::ChannelManager>> {
+        self.maybe_expire_bridge();
+
+        let channel_id = msg.channel_id;
+        let mut messages: Vec<RouteMessageTo> = Vec::new();
+
+        // Acknowledge the miner optimistically after upstream accepts (or always on valid path).
+        let build_error = |code: &str| {
+            Mining::SubmitSharesError(SubmitSharesError {
+                channel_id,
+                sequence_number: msg.sequence_number,
+                error_code: code.try_into().expect("valid error code"),
+            })
+        };
+
+        let prefix_and_rollable = self.downstream.with(&downstream_id, |downstream| {
+            downstream
+                .extended_channels
+                .with(&channel_id, |ch| {
+                    (
+                        ch.get_extranonce_prefix().to_vec(),
+                        ch.get_rollable_extranonce_size() as usize,
+                    )
+                })
+        });
+
+        let Some(Some((extranonce_prefix, rollable))) = prefix_and_rollable else {
+            messages.push((downstream_id, build_error("invalid-channel-id")).into());
+            for message in messages {
+                let _ = message.forward(&self.channel_manager_io).await;
+            }
+            return Ok(());
+        };
+
+        if msg.extranonce.len() != rollable {
+            messages.push((downstream_id, build_error("bad-extranonce-size")).into());
+            for message in messages {
+                let _ = message.forward(&self.channel_manager_io).await;
+            }
+            return Ok(());
+        }
+
+        // Fully resolve inside the lock so no non-Send poison/error types cross `.await`.
+        let forward_msg: Option<Mining<'static>> =
+            match self.upstream_channel.with(|maybe_upstream| {
+                let Some(upstream_channel) = maybe_upstream.as_mut() else {
+                    return None;
+                };
+
+                let upstream_extranonce_prefix = upstream_channel.get_extranonce_prefix();
+                if extranonce_prefix.len() < upstream_extranonce_prefix.len() {
+                    return None;
+                }
+                let mid_prefix = &extranonce_prefix[upstream_extranonce_prefix.len()..];
+
+                let mut full_rollable = Vec::new();
+                full_rollable.extend_from_slice(mid_prefix);
+                full_rollable.extend_from_slice(msg.extranonce.as_bytes());
+
+                let mut upstream_message = msg.clone();
+                upstream_message.channel_id = upstream_channel.get_channel_id();
+                upstream_message.job_id = bridge_ref.pool_job_id;
+                upstream_message.sequence_number = 0;
+                let Ok(en) = full_rollable.try_into() else {
+                    return None;
+                };
+                upstream_message.extranonce = en;
+
+                match upstream_channel.validate_share(upstream_message.clone()) {
+                    Ok(client::share_accounting::ShareValidationResult::Valid(share_hash)) => {
+                        upstream_message.sequence_number =
+                            self.sequence_number_factory.fetch_add(1, Ordering::Relaxed);
+                        info!(
+                            "Bridge share valid → upstream: ch={}, seq={}, hash={} ✅",
+                            channel_id, upstream_message.sequence_number, share_hash
+                        );
+                        Some(Mining::SubmitSharesExtended(upstream_message.into_static()))
+                    }
+                    Ok(client::share_accounting::ShareValidationResult::BlockFound(share_hash)) => {
+                        upstream_message.sequence_number =
+                            self.sequence_number_factory.fetch_add(1, Ordering::Relaxed);
+                        info!(
+                            "Bridge share 💰 Block Found!!! 💰{share_hash} — submitting to pool only"
+                        );
+                        Some(Mining::SubmitSharesExtended(upstream_message.into_static()))
+                    }
+                    Err(err) => {
+                        debug!(?err, channel_id, "Bridge share rejected by upstream validation");
+                        None
+                    }
+                }
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(?e, "Bridge share lock failed");
+                    None
+                }
+            };
+
+        match forward_msg {
+            Some(upstream_msg) => {
+                let success = SubmitSharesSuccess {
+                    channel_id,
+                    last_sequence_number: msg.sequence_number,
+                    new_submits_accepted_count: 1,
+                    new_shares_sum: 1,
+                };
+                messages.push((downstream_id, Mining::SubmitSharesSuccess(success)).into());
+                messages.push(upstream_msg.into());
+                let _ = self.vardiff.with_mut(&(downstream_id, channel_id).into(), |vd| {
+                    vd.increment_shares_since_last_update();
+                });
+            }
+            None => {
+                messages.push((downstream_id, build_error("invalid-share")).into());
+            }
+        }
+
+        for message in messages {
+            if let Err(e) = message.forward(&self.channel_manager_io).await {
+                error!("Failed to forward bridge share message: {e:?}");
+            }
+        }
+        Ok(())
     }
 }

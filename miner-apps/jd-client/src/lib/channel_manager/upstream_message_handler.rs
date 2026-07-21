@@ -1,4 +1,7 @@
-use std::sync::atomic::Ordering;
+use std::{
+    sync::atomic::Ordering,
+    time::Instant,
+};
 
 use stratum_apps::{
     stratum_core::{
@@ -23,12 +26,220 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     channel_manager::{
-        downstream_message_handler::RouteMessageTo, ChannelManager, DeclaredJob,
-        JDC_LOCAL_PREFIX_BYTES, JDC_MAX_CHANNELS,
+        downstream_message_handler::RouteMessageTo, BridgeJobRef, ChannelManager, DeclaredJob,
+        WorkSource, JDC_LOCAL_PREFIX_BYTES, JDC_MAX_CHANNELS,
     },
     error::{self, JDCError, JDCErrorKind},
     utils::{create_close_channel_msg, validate_cached_share, UpstreamState},
 };
+
+#[cfg_attr(not(test), hotpath::measure_all)]
+impl ChannelManager {
+    /// Activate buffered pool tip work if the pool appears ahead of the local TP tip.
+    async fn try_activate_upstream_tip_bridge(
+        &mut self,
+        snph: SetNewPrevHash<'static>,
+    ) -> Result<(), JDCError<error::ChannelManager>> {
+        let pool_job = self
+            .pending_upstream_job
+            .with(|pending| pending.take())
+            .map_err(JDCError::shutdown)?;
+
+        let Some(pool_job) = pool_job else {
+            debug!("SetNewPrevHash from pool with no buffered NewExtendedMiningJob — ignoring");
+            return Ok(());
+        };
+
+        if pool_job.job_id != snph.job_id {
+            warn!(
+                buffered_job_id = pool_job.job_id,
+                snph_job_id = snph.job_id,
+                "Buffered upstream job id does not match SetNewPrevHash — ignoring tip bridge"
+            );
+            return Ok(());
+        }
+
+        let pool_prev: [u8; 32] = snph.prev_hash.to_array();
+
+        let local_prev = self
+            .last_new_prev_hash
+            .with(|prev| prev.as_ref().map(|p| p.prev_hash.to_array()))
+            .map_err(JDCError::shutdown)?;
+
+        // Same tip as local TP → local JD path owns work.
+        if let Some(local) = local_prev {
+            if local == pool_prev {
+                info!("Pool tip matches local tip — not entering upstream tip bridge");
+                return Ok(());
+            }
+        }
+
+        // Already bridging this tip: refresh nothing, keep existing window.
+        let already = self
+            .work_source
+            .with(|ws| {
+                matches!(
+                    ws,
+                    WorkSource::UpstreamBridge {
+                        pool_prev_hash,
+                        ..
+                    } if *pool_prev_hash == pool_prev
+                )
+            })
+            .map_err(JDCError::shutdown)?;
+        if already {
+            debug!("Already bridging this pool tip — ignoring duplicate push");
+            return Ok(());
+        }
+
+        // Store job on the client-side upstream channel for share validation / forward.
+        self.upstream_channel
+            .with(|maybe_upstream| {
+                let Some(upstream) = maybe_upstream.as_mut() else {
+                    return Err(JDCError::log(JDCErrorKind::UpstreamNotFound));
+                };
+                if upstream.get_channel_id() != snph.channel_id
+                    && upstream.get_channel_id() != pool_job.channel_id
+                {
+                    warn!(
+                        upstream_channel = upstream.get_channel_id(),
+                        snph_channel = snph.channel_id,
+                        "Pool tip messages on unexpected channel id — continuing"
+                    );
+                }
+                upstream
+                    .on_new_extended_mining_job(pool_job.clone())
+                    .map_err(|e| {
+                        error!(?e, "Failed to store pool job on upstream channel");
+                        JDCError::log(JDCErrorKind::CustomJobError)
+                    })?;
+                upstream
+                    .on_set_new_prev_hash(snph.clone())
+                    .map_err(|e| {
+                        error!(?e, "Failed to apply pool SetNewPrevHash on upstream channel");
+                        JDCError::log(JDCErrorKind::CustomJobError)
+                    })?;
+                Ok(())
+            })
+            .map_err(JDCError::shutdown)??;
+
+        let epoch = self.bridge_epoch_factory.fetch_add(1, Ordering::Relaxed) as u64;
+        let now = Instant::now();
+        let deadline = now + self.upstream_tip_work_timeout;
+        let pool_job_id = pool_job.job_id;
+        let pool_nbits = snph.nbits;
+        let pool_min_ntime = snph.min_ntime;
+
+        self.work_source
+            .with(|ws| {
+                *ws = WorkSource::UpstreamBridge {
+                    epoch,
+                    accepted_at: now,
+                    deadline,
+                    pool_prev_hash: pool_prev,
+                    pool_job_id,
+                    pool_nbits,
+                    pool_min_ntime,
+                };
+            })
+            .map_err(JDCError::shutdown)?;
+
+        // Drop jobs from any previous bridge session.
+        self.bridge_job_map.retain(|_, r| r.epoch == epoch);
+
+        info!(
+            epoch,
+            pool_job_id,
+            timeout_secs = self.upstream_tip_work_timeout.as_secs(),
+            "Entering upstream tip bridge — pool tip appears ahead of local TP"
+        );
+
+        self.fanout_bridge_job_to_downstreams(&pool_job, &snph, epoch, pool_prev)
+            .await
+    }
+
+    /// Fan out rewritten pool work to all connected downstream extended channels.
+    async fn fanout_bridge_job_to_downstreams(
+        &mut self,
+        pool_job: &NewExtendedMiningJob<'static>,
+        snph: &SetNewPrevHash<'static>,
+        epoch: u64,
+        pool_prev: [u8; 32],
+    ) -> Result<(), JDCError<error::ChannelManager>> {
+        let mut messages: Vec<RouteMessageTo> = Vec::new();
+        let pool_job_id = pool_job.job_id;
+        let pool_nbits = snph.nbits;
+        let pool_min_ntime = snph.min_ntime;
+        let prev_hash = snph.prev_hash.clone().into_static();
+
+        // Collect (downstream_id, channel_id, prefix) first so we do not re-enter maps.
+        let mut targets: Vec<(usize, u32, Vec<u8>)> = Vec::new();
+        self.downstream.for_each(|downstream_id, downstream| {
+            downstream.extended_channels.for_each(|channel_id, channel| {
+                targets.push((
+                    downstream_id,
+                    channel_id,
+                    channel.get_extranonce_prefix().to_vec(),
+                ));
+            });
+        });
+
+        for (downstream_id, channel_id, prefix) in targets {
+            let local_job_id = self.bridge_job_id_factory.fetch_add(1, Ordering::Relaxed);
+            let job = match ChannelManager::rewrite_pool_job_for_downstream(
+                pool_job,
+                channel_id,
+                local_job_id,
+                &prefix,
+                Some(pool_min_ntime),
+            ) {
+                Ok(j) => j,
+                Err(e) => {
+                    error!(?e, channel_id, "Failed to rewrite pool job for downstream");
+                    continue;
+                }
+            };
+
+            self.bridge_job_map.insert(
+                (downstream_id, channel_id, local_job_id).into(),
+                BridgeJobRef {
+                    pool_job_id,
+                    pool_prev_hash: pool_prev,
+                    pool_nbits,
+                    pool_min_ntime,
+                    epoch,
+                },
+            );
+
+            messages.push((downstream_id, Mining::NewExtendedMiningJob(job)).into());
+            messages.push(
+                (
+                    downstream_id,
+                    Mining::SetNewPrevHash(SetNewPrevHash {
+                        channel_id,
+                        job_id: local_job_id,
+                        prev_hash: prev_hash.clone(),
+                        min_ntime: pool_min_ntime,
+                        nbits: pool_nbits,
+                    }),
+                )
+                    .into(),
+            );
+        }
+
+        for message in messages {
+            if let Err(e) = message.forward(&self.channel_manager_io).await {
+                error!("Failed to forward bridge job message: {e:?}");
+            }
+        }
+
+        info!(
+            epoch,
+            pool_job_id, "Fanned out upstream tip bridge work to downstreams"
+        );
+        Ok(())
+    }
+}
 
 #[cfg_attr(not(test), hotpath::measure_all)]
 impl HandleMiningMessagesFromServerAsync for ChannelManager {
@@ -573,7 +784,8 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         Ok(())
     }
 
-    // Handles `NewMiningJob` messages from upstream. JDC ignores it.
+    // Handles `NewMiningJob` messages from upstream. JDC ignores standard jobs
+    // (only extended channels are used with the pool).
     async fn handle_new_mining_job(
         &mut self,
         _server_id: Option<usize>,
@@ -581,32 +793,53 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         warn!("Received: {}", msg);
-        warn!("⚠️ JDC does not expect jobs from the upstream server — ignoring.");
+        warn!("⚠️ JDC does not expect standard jobs from the upstream server — ignoring.");
         Ok(())
     }
 
-    // Handles `NewExtendedMiningJob` messages from upstream. JDC ignores it.
+    // Handles `NewExtendedMiningJob` from upstream.
+    //
+    // When `accept_upstream_tip_work` is enabled the job is buffered until a matching
+    // mining-protocol `SetNewPrevHash` arrives (ckpool tip push). Otherwise ignored.
     async fn handle_new_extended_mining_job(
         &mut self,
         _server_id: Option<usize>,
         msg: NewExtendedMiningJob<'_>,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        warn!("Received: {}", msg);
-        warn!("⚠️ JDC does not expect jobs from the upstream server — ignoring.");
+        if !self.accept_upstream_tip_work {
+            warn!("Received: {}", msg);
+            warn!("⚠️ JDC does not expect jobs from the upstream server — ignoring.");
+            return Ok(());
+        }
+
+        info!("Received (buffering for tip bridge): {}", msg);
+        self.pending_upstream_job
+            .with(|pending| *pending = Some(msg.into_static()))
+            .map_err(JDCError::shutdown)?;
         Ok(())
     }
 
-    // Handles `SetNewPrevHash` messages from upstream. JDC ignores it.
+    // Handles mining-protocol `SetNewPrevHash` from upstream.
+    //
+    // With tip-bridge enabled, activates buffered pool work when the pool tip is ahead of
+    // the local TP tip and fans it out to downstreams for a bounded window.
     async fn handle_set_new_prev_hash(
         &mut self,
         _server_id: Option<usize>,
         msg: SetNewPrevHash<'_>,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        warn!("Received: {}", msg);
-        warn!("⚠️ JDC does not expect prevhash updates from the upstream server — ignoring.");
-        Ok(())
+        if !self.accept_upstream_tip_work {
+            warn!("Received: {}", msg);
+            warn!("⚠️ JDC does not expect prevhash updates from the upstream server — ignoring.");
+            return Ok(());
+        }
+
+        info!("Received (tip bridge candidate): {}", msg);
+        self.maybe_expire_bridge();
+        self.try_activate_upstream_tip_bridge(msg.into_static())
+            .await
     }
 
     // Handles `SetCustomMiningJobSuccess` messages from upstream.
