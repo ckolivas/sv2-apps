@@ -42,7 +42,9 @@ use stratum_apps::{
             SetTarget, UpdateChannel,
         },
         parsers_sv2::{AnyMessage, JobDeclaration, Mining, TemplateDistribution, Tlv},
-        template_distribution_sv2::{NewTemplate, SetNewPrevHash as SetNewPrevHashTdp},
+        template_distribution_sv2::{
+            NewTemplate, RequestTransactionData, SetNewPrevHash as SetNewPrevHashTdp,
+        },
     },
     sync::{SharedLock, SharedMap},
     task_manager::TaskManager,
@@ -648,6 +650,9 @@ impl ChannelManager {
                 "upstream tip bridge timed out; re-announcing local tip work (clean=false cutover)",
             );
             self.reannounce_local_tip_work().await;
+            // Local fee-bump JD traffic was suppressed while bridging; re-sync so the
+            // pool accepts shares on the re-announced local tip.
+            self.resync_local_jd_after_bridge_exit().await;
         }
     }
 
@@ -808,6 +813,204 @@ impl ChannelManager {
                 messages = count,
                 "Re-announced local tip work after upstream tip bridge timeout (soft cutover)"
             );
+        }
+    }
+
+    /// After leaving the tip bridge, re-push local JD work to the pool if needed.
+    ///
+    /// While bridging we suppress fee-bump `DeclareMiningJob` / `SetCustomMiningJob` for the
+    /// lagging local tip. On timeout cutover, re-send a deferred custom job, re-declare, or
+    /// re-request TX data so upstream can accept shares on the re-announced local tip.
+    pub(crate) async fn resync_local_jd_after_bridge_exit(&self) {
+        if self.mode.is_solo_mining() {
+            return;
+        }
+
+        let Ok(Some(prevhash)) = self.last_new_prev_hash.get() else {
+            return;
+        };
+        let future_template = self.last_future_template.get().ok().flatten();
+        let future_template_id = future_template.as_ref().map(|t| t.template_id);
+        let local_tip = prevhash.prev_hash.to_array();
+
+        let mut deferred_custom: Option<SetCustomMiningJob<'static>> = None;
+        let mut pending_declare: Option<DeclareMiningJob<'static>> = None;
+        self.last_declare_job_store.for_each(|_, job| {
+            let matches_tip = job
+                .prev_hash
+                .as_ref()
+                .map(|p| p.prev_hash.to_array() == local_tip)
+                .unwrap_or(false)
+                || Some(job.template.template_id) == future_template_id
+                || job.template.template_id == prevhash.template_id;
+            if !matches_tip {
+                return;
+            }
+            if let Some(custom) = job.set_custom_mining_job.clone() {
+                deferred_custom = Some(custom);
+            } else if let Some(declare) = job.declare_mining_job.clone() {
+                pending_declare = Some(declare);
+            }
+        });
+
+        if let Some(custom_job) = deferred_custom {
+            let channel_id = custom_job.channel_id;
+            let message = Mining::SetCustomMiningJob(custom_job).into_static();
+            let Ok(sv2_frame) = AnyMessage::Mining(message).try_into() else {
+                error!("Bridge exit: failed to frame deferred SetCustomMiningJob");
+                return;
+            };
+            match self.channel_manager_io.upstream_sender.send(sv2_frame).await {
+                Ok(()) => info!(
+                    channel_id,
+                    "Bridge exit: re-sent deferred SetCustomMiningJob for local tip"
+                ),
+                Err(e) => error!(
+                    ?e,
+                    "Bridge exit: failed to send deferred SetCustomMiningJob"
+                ),
+            }
+            return;
+        }
+
+        if self.mode.is_full_template() {
+            if let Some(declare_job) = pending_declare {
+                match self
+                    .channel_manager_io
+                    .jd_sender
+                    .send(JobDeclaration::DeclareMiningJob(declare_job))
+                    .await
+                {
+                    Ok(()) => info!(
+                        "Bridge exit: re-sent DeclareMiningJob for local tip"
+                    ),
+                    Err(e) => error!(
+                        ?e,
+                        "Bridge exit: failed to re-send DeclareMiningJob"
+                    ),
+                }
+                return;
+            }
+
+            // Kick the declare path again for the best-known local template.
+            // Re-insert into template_store if a prior RTT already consumed it.
+            let template_id = if let Some(ref t) = future_template {
+                self.template_store.insert(t.template_id, t.clone());
+                t.template_id
+            } else {
+                prevhash.template_id
+            };
+            match self
+                .channel_manager_io
+                .tp_sender
+                .send(TemplateDistribution::RequestTransactionData(
+                    RequestTransactionData { template_id },
+                ))
+                .await
+            {
+                Ok(()) => info!(
+                    template_id,
+                    "Bridge exit: requested transaction data to re-declare local tip"
+                ),
+                Err(e) => error!(
+                    ?e,
+                    template_id,
+                    "Bridge exit: failed to request transaction data for local tip"
+                ),
+            }
+            return;
+        }
+
+        if self.mode.is_coinbase_only() {
+            let Some(template) = future_template else {
+                debug!("Bridge exit: no last_future_template for coinbase-only re-sync");
+                return;
+            };
+            let Some(token) = self
+                .allocate_tokens
+                .with(|tokens| tokens.pop_front())
+                .ok()
+                .flatten()
+            else {
+                warn!("Bridge exit: no mining job token available for coinbase-only re-sync");
+                let _ = self.allocate_tokens(1).await;
+                return;
+            };
+            let Ok(Some((upstream_channel_id, full_extranonce_size))) =
+                self.upstream_channel.with(|channel| {
+                    channel
+                        .as_ref()
+                        .map(|c| (c.get_channel_id(), c.get_full_extranonce_size()))
+                })
+            else {
+                let _ = self.allocate_tokens.with(|tokens| tokens.push_front(token));
+                return;
+            };
+            let Ok(outputs) = self.coinbase_outputs.get() else {
+                let _ = self.allocate_tokens.with(|tokens| tokens.push_front(token));
+                return;
+            };
+            let mut outputs = match deserialize_outputs(outputs) {
+                Ok(o) => o,
+                Err(_) => {
+                    let _ = self.allocate_tokens.with(|tokens| tokens.push_front(token));
+                    return;
+                }
+            };
+            outputs[0].value = Amount::from_sat(template.coinbase_tx_value_remaining);
+            let request_id = self.request_id_factory.fetch_add(1, Ordering::Relaxed);
+            // Resolve fully inside the lock so non-Send poison guards never cross `.await`.
+            let built_custom: Option<SetCustomMiningJob<'static>> =
+                self.job_factory
+                    .with(|job_factory| {
+                        let job_factory = job_factory.as_mut()?;
+                        match job_factory.new_custom_job(
+                            upstream_channel_id,
+                            request_id,
+                            token.mining_job_token,
+                            prevhash.clone().into(),
+                            template.clone(),
+                            outputs,
+                            full_extranonce_size,
+                        ) {
+                            Ok(job) => Some(job.into_static()),
+                            Err(_) => None,
+                        }
+                    })
+                    .ok()
+                    .flatten();
+
+            if let Some(custom_job) = built_custom {
+                self.last_declare_job_store.insert(
+                    request_id,
+                    DeclaredJob {
+                        declare_mining_job: None,
+                        template: template.into_static(),
+                        prev_hash: Some(prevhash),
+                        set_custom_mining_job: Some(custom_job.clone()),
+                        coinbase_output: self.coinbase_outputs.get().unwrap_or_default(),
+                        tx_list: vec![],
+                    },
+                );
+                let message = Mining::SetCustomMiningJob(custom_job).into_static();
+                if let Ok(sv2_frame) = AnyMessage::Mining(message).try_into() {
+                    if self
+                        .channel_manager_io
+                        .upstream_sender
+                        .send(sv2_frame)
+                        .await
+                        .is_ok()
+                    {
+                        info!(
+                            request_id,
+                            "Bridge exit: sent SetCustomMiningJob for local tip (coinbase-only)"
+                        );
+                    }
+                }
+            } else {
+                warn!("Bridge exit: failed to build coinbase-only SetCustomMiningJob");
+            }
+            let _ = self.allocate_tokens(1).await;
         }
     }
 
