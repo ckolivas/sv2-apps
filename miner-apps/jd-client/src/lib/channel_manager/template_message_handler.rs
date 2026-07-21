@@ -45,6 +45,14 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         // Still refresh internal channel state so timeout re-announce / tip catch-up
         // have up-to-date local work. Exit only on local SetNewPrevHash or timeout.
         let bridging = self.is_bridging();
+        let allow_wire = crate::channel_manager::tip_bridge::allow_local_template_wire_fanout(
+            bridging,
+        );
+        let allow_fee_bump_declare =
+            crate::channel_manager::tip_bridge::allow_local_fee_bump_declare(
+                bridging,
+                msg.future_template,
+            );
         if bridging {
             info!(
                 template_id = msg.template_id,
@@ -69,7 +77,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
 
         // While bridging, only request TX data for future templates (prepare for
         // local tip catch-up). Fee-bump declares on the old tip would fight the bridge.
-        if self.mode.is_full_template() && (!bridging || msg.future_template) {
+        if self.mode.is_full_template() && allow_fee_bump_declare {
             self.channel_manager_io
                 .tp_sender
                 .send(TemplateDistribution::RequestTransactionData(
@@ -95,7 +103,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
             .map_err(JDCError::shutdown)?;
 
         // Never mint SetCustomMiningJob for the lagging local tip while bridging.
-        let coinbase_only_token = if !bridging
+        let coinbase_only_token = if allow_wire
             && !msg.future_template
             && self.mode.is_coinbase_only()
             && upstream_ready
@@ -197,7 +205,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                 .with(|group_channel| group_channel.is_empty())
                 .map_err(JDCError::shutdown)?;
             // Soft-suppress wire fan-out while bridging so miners stay on pool tip work.
-            if !bridging && !requires_standard_jobs && !empty_group_channel {
+            if allow_wire && !requires_standard_jobs && !empty_group_channel {
                 messages.push(
                     (
                         downstream_id,
@@ -242,7 +250,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                             let job = standard_channel
                                 .get_future_job(job_id)
                                 .expect("future job must exist");
-                            if !bridging {
+                            if allow_wire {
                                 messages.push(
                                     (
                                         downstream_id,
@@ -257,7 +265,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                                 .get_active_job()
                                 .expect("active job must exist");
                             let job_id = job.get_job_id();
-                            if !bridging {
+                            if allow_wire {
                                 messages.push(
                                     (
                                         downstream_id,
@@ -457,7 +465,10 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
 
         // Fee-bump declares for the lagging local tip must not race the pool tip bridge.
         // Future templates are already handled above (stored for SNPH activation).
-        if self.is_bridging() {
+        if !crate::channel_manager::tip_bridge::allow_local_fee_bump_declare(
+            self.is_bridging(),
+            false,
+        ) {
             info!(
                 template_id = msg.template_id,
                 "Bridging: skipping DeclareMiningJob for local non-future template"

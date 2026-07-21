@@ -822,28 +822,25 @@ impl ChannelManager {
     /// lagging local tip. On timeout cutover, re-send a deferred custom job, re-declare, or
     /// re-request TX data so upstream can accept shares on the re-announced local tip.
     pub(crate) async fn resync_local_jd_after_bridge_exit(&self) {
-        if self.mode.is_solo_mining() {
-            return;
-        }
-
         let Ok(Some(prevhash)) = self.last_new_prev_hash.get() else {
             return;
         };
         let future_template = self.last_future_template.get().ok().flatten();
         let future_template_id = future_template.as_ref().map(|t| t.template_id);
         let local_tip = prevhash.prev_hash.to_array();
+        let preferred_template_id = future_template_id.or(Some(prevhash.template_id));
 
         let mut deferred_custom: Option<SetCustomMiningJob<'static>> = None;
         let mut pending_declare: Option<DeclareMiningJob<'static>> = None;
         self.last_declare_job_store.for_each(|_, job| {
-            let matches_tip = job
-                .prev_hash
-                .as_ref()
-                .map(|p| p.prev_hash.to_array() == local_tip)
-                .unwrap_or(false)
-                || Some(job.template.template_id) == future_template_id
-                || job.template.template_id == prevhash.template_id;
-            if !matches_tip {
+            let job_prev = job.prev_hash.as_ref().map(|p| p.prev_hash.to_array());
+            if !tip_bridge::declared_job_matches_local_tip(
+                job_prev,
+                job.template.template_id,
+                local_tip,
+                prevhash.template_id,
+                future_template_id,
+            ) {
                 return;
             }
             if let Some(custom) = job.set_custom_mining_job.clone() {
@@ -853,75 +850,87 @@ impl ChannelManager {
             }
         });
 
-        if let Some(custom_job) = deferred_custom {
-            let channel_id = custom_job.channel_id;
-            let message = Mining::SetCustomMiningJob(custom_job).into_static();
-            let Ok(sv2_frame) = AnyMessage::Mining(message).try_into() else {
-                error!("Bridge exit: failed to frame deferred SetCustomMiningJob");
-                return;
-            };
-            match self.channel_manager_io.upstream_sender.send(sv2_frame).await {
-                Ok(()) => info!(
-                    channel_id,
-                    "Bridge exit: re-sent deferred SetCustomMiningJob for local tip"
-                ),
-                Err(e) => error!(
-                    ?e,
-                    "Bridge exit: failed to send deferred SetCustomMiningJob"
-                ),
-            }
-            return;
-        }
+        let action = tip_bridge::decide_jd_resync(
+            self.mode.is_solo_mining(),
+            deferred_custom.is_some(),
+            pending_declare.is_some(),
+            self.mode.is_full_template(),
+            self.mode.is_coinbase_only(),
+            preferred_template_id,
+        );
 
-        if self.mode.is_full_template() {
-            if let Some(declare_job) = pending_declare {
+        match action {
+            tip_bridge::JdResyncAction::None => return,
+            tip_bridge::JdResyncAction::SendDeferredCustomJob => {
+                let Some(custom_job) = deferred_custom else {
+                    return;
+                };
+                let channel_id = custom_job.channel_id;
+                let message = Mining::SetCustomMiningJob(custom_job).into_static();
+                let Ok(sv2_frame) = AnyMessage::Mining(message).try_into() else {
+                    error!("Bridge exit: failed to frame deferred SetCustomMiningJob");
+                    return;
+                };
+                match self.channel_manager_io.upstream_sender.send(sv2_frame).await {
+                    Ok(()) => info!(
+                        channel_id,
+                        "Bridge exit: re-sent deferred SetCustomMiningJob for local tip"
+                    ),
+                    Err(e) => error!(
+                        ?e,
+                        "Bridge exit: failed to send deferred SetCustomMiningJob"
+                    ),
+                }
+                return;
+            }
+            tip_bridge::JdResyncAction::Redeclare => {
+                let Some(declare_job) = pending_declare else {
+                    return;
+                };
                 match self
                     .channel_manager_io
                     .jd_sender
                     .send(JobDeclaration::DeclareMiningJob(declare_job))
                     .await
                 {
+                    Ok(()) => info!("Bridge exit: re-sent DeclareMiningJob for local tip"),
+                    Err(e) => error!(?e, "Bridge exit: failed to re-send DeclareMiningJob"),
+                }
+                return;
+            }
+            tip_bridge::JdResyncAction::RequestTxData { template_id } => {
+                // Re-insert into template_store if a prior RTT already consumed it.
+                if let Some(ref t) = future_template {
+                    if t.template_id == template_id {
+                        self.template_store.insert(t.template_id, t.clone());
+                    }
+                }
+                match self
+                    .channel_manager_io
+                    .tp_sender
+                    .send(TemplateDistribution::RequestTransactionData(
+                        RequestTransactionData { template_id },
+                    ))
+                    .await
+                {
                     Ok(()) => info!(
-                        "Bridge exit: re-sent DeclareMiningJob for local tip"
+                        template_id,
+                        "Bridge exit: requested transaction data to re-declare local tip"
                     ),
                     Err(e) => error!(
                         ?e,
-                        "Bridge exit: failed to re-send DeclareMiningJob"
+                        template_id,
+                        "Bridge exit: failed to request transaction data for local tip"
                     ),
                 }
                 return;
             }
-
-            // Kick the declare path again for the best-known local template.
-            // Re-insert into template_store if a prior RTT already consumed it.
-            let template_id = if let Some(ref t) = future_template {
-                self.template_store.insert(t.template_id, t.clone());
-                t.template_id
-            } else {
-                prevhash.template_id
-            };
-            match self
-                .channel_manager_io
-                .tp_sender
-                .send(TemplateDistribution::RequestTransactionData(
-                    RequestTransactionData { template_id },
-                ))
-                .await
-            {
-                Ok(()) => info!(
-                    template_id,
-                    "Bridge exit: requested transaction data to re-declare local tip"
-                ),
-                Err(e) => error!(
-                    ?e,
-                    template_id,
-                    "Bridge exit: failed to request transaction data for local tip"
-                ),
+            tip_bridge::JdResyncAction::MintCoinbaseOnly => {
+                // Handled below (needs tokens / job factory).
             }
-            return;
         }
 
-        if self.mode.is_coinbase_only() {
+        if matches!(action, tip_bridge::JdResyncAction::MintCoinbaseOnly) {
             let Some(template) = future_template else {
                 debug!("Bridge exit: no last_future_template for coinbase-only re-sync");
                 return;
