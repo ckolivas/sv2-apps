@@ -246,6 +246,16 @@ impl HandleJobDeclarationMessagesFromServerAsync for ChannelManager {
             )));
         }
 
+        // While bridging pool tip work, do not push local-tip custom jobs upstream —
+        // miners are hashing the pool tip, not this lagging local tip job.
+        if self.is_bridging() {
+            info!(
+                request_id = msg.request_id,
+                "Bridging: deferred SetCustomMiningJob for local tip work"
+            );
+            return Ok(());
+        }
+
         let channel_id = custom_job.channel_id;
 
         debug!("Sending SetCustomMiningJob to the upstream with channel_id: {channel_id}");
